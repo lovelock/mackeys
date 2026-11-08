@@ -152,7 +152,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "nix",
- "tokio",
 ]
 
 [[package]]
@@ -305,6 +304,7 @@ dependencies = [
  "anyhow",
  "evdev",
  "serde",
+ "signal-hook",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -527,6 +527,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
 ]
 
 [[package]]

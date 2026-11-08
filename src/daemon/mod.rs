@@ -1,5 +1,115 @@
+//! Daemon loop: input readers → engine → uinput sink, plus lifecycle.
+
 pub mod devices;
-pub mod engine_loop;
+pub mod input;
 mod sink;
 
-pub use engine_loop::run;
+use input::LoopMsg;
+use sink::Sink;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+
+use crate::engine::{apply, shutdown, DeviceState};
+use crate::types::{Act, Ctx, Kb, Out, RuleSet};
+
+/// Administrative entry for the `run` subcommand.
+pub fn run(args: &[String]) -> anyhow::Result<()> {
+    if args.iter().any(|a| a == "--dry") {
+        let infos = devices::scan(&[])?;
+        println!("mackeys dry-run: device inventory:");
+        for i in &infos {
+            println!(
+                "  {:10} letter-device={} {}",
+                if i.managed { "[managed]" } else { "[native ]" },
+                i.letter.arg_if(),
+                i.name,
+            );
+        }
+        println!("(no grabs performed in dry mode)");
+        return Ok(());
+    }
+    run_daemon(Kb::Windows, true, RuleSet::default())
+}
+
+trait BoolExt {
+    fn arg_if(&self) -> &'static str;
+}
+impl BoolExt for bool {
+    fn arg_if(&self) -> &'static str {
+        if *self { "yes" } else { "no " }
+    }
+}
+
+pub fn run_daemon(kb: Kb, swap_caps: bool, rules: RuleSet) -> anyhow::Result<()> {
+    tracing::info!("mackeys daemon starting");
+    let (tx, rx) = mpsc::channel::<LoopMsg>();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // signal handling: SIGINT/SIGTERM set the stop flag; main loop observes it.
+    signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone())?;
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone())?;
+
+    // spawn readers for managed devices
+    let infos = devices::scan(&[])?;
+    let mut tag_next = 0usize;
+    for i in &infos {
+        if !i.managed {
+            continue;
+        }
+        match input::spawn_reader(i.clone(), tag_next, tx.clone(), stop.clone()) {
+            Ok(_) => tracing::info!(name = %i.name, path = %i.path.display(), "grabbed"),
+            Err(e) => tracing::warn!(name = %i.name, error = %e, "grab failed — device stays native"),
+        }
+        tag_next += 1;
+    }
+    drop(tx);
+
+    let mut sink = Sink::new()?;
+    let mut states: BTreeMap<usize, DeviceState> = BTreeMap::new();
+    let mut sigtick = 0;
+
+    while !stop.load(Ordering::Relaxed) {
+        let msg = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(m) => m,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        match msg {
+            LoopMsg::Act(tag, act) => {
+                let state = states.entry(tag).or_default();
+                let outv = apply(state, act, kb, swap_caps, Ctx::Gui, &rules);
+                emit(&mut sink, outv);
+            }
+            LoopMsg::Eof(tag) => {
+                if let Some(mut st) = states.remove(&tag) {
+                    emit(&mut sink, shutdown(&mut st));
+                }
+                states.remove(&tag);
+                tracing::info!(tag, "device reader ended; state flushed");
+            }
+        }
+        // safety valve: observe stop even under busy traffic
+        sigtick += 1;
+        if sigtick % 500 == 0 && stop.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+
+    // teardown: shutdown every device state, flush, then exit (readers ungrab)
+    stop.store(true, Ordering::Relaxed);
+    for (tag, st) in states.iter_mut() {
+        let outv = shutdown(st);
+        tracing::debug!(tag, cmds = outv.len(), "teardown");
+        emit(&mut sink, outv);
+    }
+    Ok(())
+}
+
+fn emit(sink: &mut Sink, outv: Vec<Out>) {
+    for o in outv {
+        if let Err(e) = sink.emit(o) {
+            tracing::warn!(error = %e, "sink emit failed");
+        }
+    }
+}

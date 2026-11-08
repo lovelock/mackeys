@@ -21,11 +21,11 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let mut args = std::env::args().skip(1);
-    let sub = args.next().unwrap_or_else(|| "run".into());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let sub = args.first().cloned().unwrap_or_else(|| "run".into());
 
     match sub.as_str() {
-        "run" => daemon::run(),
+        "run" => daemon::run(&args),
         "setup" => setup::setup(),
         "doctor" => setup::doctor(),
         "start" | "stop" | "status" => setup::service_ctl(&sub),
