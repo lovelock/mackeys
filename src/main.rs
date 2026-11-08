@@ -14,14 +14,15 @@ use anyhow::Result;
 const SUBCOMMANDS: &str = "run (default) | setup | doctor | start | stop | status | devices | dump | uninstall";
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let want_debug = setup::wants_debug(&args);
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(if want_debug { "debug" } else { "info" })
+            }),
         )
         .init();
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().cloned().unwrap_or_else(|| "run".into());
 
     match sub.as_str() {

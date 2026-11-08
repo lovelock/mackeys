@@ -125,6 +125,7 @@ fn process_inner(
 ) -> Vec<Out> {
     let km = code_map(kb, swap_caps);
     let out_code = km(act.code);
+    tracing::debug!(physical = act.code, value = act.value, out = out_code, "KEY");
 
     if is_modifier(out_code) && act.value != 2 {
         return match act.value {
@@ -202,11 +203,12 @@ fn process_inner(
                 .enumerate()
                 .find(|(_i, r)| r.context == ctx && matches_combo(&r.input, &held_outs, out_code));
 
-            match matched.map(|(r_id, r)| (&r.output, r.sticky, r.id.as_str())) {
-                Some((OutputSel::Ignore, _, _)) => {
+            match matched.map(|(idx, r)| (&r.output, r.sticky, r.id.as_str())) {
+                Some((OutputSel::Ignore, _, r_id)) => {
                     // swallow + release own output mods (they stay auto-released
                     // so the later physical release is silent)
                     state.pending_ignored = Some(out_code);
+                    tracing::debug!(rule = r_id, "IGNORE");
                     if let Some((_, r)) = matched {
                         for m in &r.input.mods {
                             if held_outs.contains(m) {
@@ -218,7 +220,8 @@ fn process_inner(
                     outv.push(Out::Sync);
                     outv
                 }
-                Some((OutputSel::Combo(c), is_sticky, _)) => {
+                Some((OutputSel::Combo(c), is_sticky, r_id2)) => {
+                    tracing::debug!(rule = r_id2, sticky = is_sticky, "MATCH");
                     // release "own" output mods that are PRESSED but absent
                     // from the output combo (auto_released stay untouched —
                     // they were already released and must NOT emit again)

@@ -33,3 +33,11 @@ fn doctor_helpers() {
     );
     assert!(conflicting_remappers("nothing here").is_empty());
 }
+
+#[test]
+fn wants_debug_flag() {
+    assert!(super::wants_debug(&["run".into(), "--debug".into()]));
+    assert!(super::wants_debug(&["-d".into()]));
+    assert!(!super::wants_debug(&["run".into()]));
+    assert!(!super::wants_debug(&["setup".into(), "--takeover".into()]));
+}

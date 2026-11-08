@@ -122,6 +122,11 @@ pub fn groups_contains(groups: &str, group: &str) -> bool {
     groups.split_whitespace().any(|g| g == group)
 }
 
+/// main-level flag: enable per-key debug tracing for the daemon.
+pub fn wants_debug(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--debug" || a == "-d")
+}
+
 // ---------------- CLI ----------------
 
 pub fn setup() -> Result<()> {
