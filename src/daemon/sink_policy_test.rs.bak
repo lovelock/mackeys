@@ -1,0 +1,46 @@
+//! Sink stall policy tests (pure logic): what to do when the uinput write
+//! path stalls (EAGAIN / full kernel buffer) and when it recovers.
+
+use crate::daemon::sink::StallTracker;
+use std::collections::BTreeSet;
+
+#[test]
+fn normal_flow_empties_stuck() {
+    let mut t = StallTracker::default();
+    t.note_write_result(true, 29); // ctrl down ok
+    assert!(t.stuck().is_empty());
+    t.note_write_result(true, 29); // ctrl up ok — nothing stuck
+    assert!(t.stuck().is_empty());
+}
+
+#[test]
+fn failed_release_marks_stuck_and_flush_clears_it() {
+    let mut t = StallTracker::default();
+    t.note_write_result(true, 29);  // ctrl down ok — OS believes pressed
+    t.note_write_result(false, 29); // ctrl up FAILED (stall) — OS still sees pressed
+    let stuck: BTreeSet<u16> = t.stuck().iter().copied().collect();
+    assert_eq!(stuck, [29u16].into_iter().collect(), "failed release tracked");
+    let flush = t.take_flush();
+    assert_eq!(flush, vec![29u16], "recovery must release the stuck key");
+    assert!(t.stuck().is_empty(), "flush list consumed");
+}
+
+#[test]
+fn failed_press_does_not_leave_gost() {
+    let mut t = StallTracker::default();
+    t.note_write_result(false, 30); // press of A failed — OS never saw it
+    assert!(t.stuck().is_empty(), "failed press must NOT be remembered as stuck");
+    // and the later physical release must be swallowed or written harmlessly
+    let flush = t.take_flush();
+    assert!(flush.is_empty());
+}
+
+#[test]
+fn multiple_stuck_keys_flush_in_order() {
+    let mut t = StallTracker::default();
+    t.note_write_result(true, 29);
+    t.note_write_result(true, 42);
+    t.note_write_result(false, 29);
+    t.note_write_result(false, 42);
+    assert_eq!(t.take_flush(), vec![29, 42]);
+}

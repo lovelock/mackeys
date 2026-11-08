@@ -6,7 +6,7 @@
 pub mod devices;
 pub mod enumerator;
 pub mod input;
-mod sink;
+pub mod sink;
 pub mod udevwatch;
 
 use enumerator::Enumerator;
