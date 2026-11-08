@@ -280,3 +280,49 @@ fn combo_rule_stream_shape() {
     let pressC = got.iter().filter(|e| matches!(e, super::Out::Key(46, 1))).count();
     assert_eq!(pressC, 1);
 }
+
+// ---- T5: terminal family via the real compiled table ----
+#[test]
+fn term_cmd_c_yields_ctrl_shift_c() {
+    let cfg = crate::map::config::Config::parse_toml("").expect("default config");
+    let rules = crate::map::compile(Kb::Windows, Ctx::Terminal, &cfg);
+    let acts = [
+        act(56, 1), // physical lalt (cmd) down
+        act(46, 1), // C down
+        act(46, 0),
+        act(56, 0),
+    ];
+    let got = drive(Kb::Windows, true, Ctx::Terminal, &rules, &acts);
+    // stream shape: R_CTRL down, LSHIFT down, C down, C up, LSHIFT up, R_CTRL up
+    let shift_before_c = got.iter().take_while(
+        |e| !(matches!(e, Out::Key(46, 1)))).any(|e| matches!(e, Out::Key(42, 1)));
+    let shift_after_c = got.iter().skip_while(
+        |e| !matches!(e, Out::Key(46, 0))).any(|e| matches!(e, Out::Key(42, 0)));
+    assert!(shift_before_c, "SHIFT must be pressed before C");
+    assert!(shift_after_c, "SHIFT must be released after C");
+    assert!(got.iter().any(|e| matches!(e, Out::Key(42, 1))), "ctrl+shift present");
+}
+
+#[test]
+fn passthrough_ctrl_space_every_context_and_kb() {
+    // full-matrix reinforcement of the S1 contract with the REAL tables
+    let cfg = crate::map::config::Config::parse_toml("").expect("default config");
+    let acts = [act(58, 1), act(57, 1), act(57, 0), act(58, 0)];
+    let expected_keys: Vec<(u16, i32)> = vec![(29, 1), (57, 1), (57, 0), (29, 0)];
+    for kb in [Kb::Windows, Kb::Apple] {
+        for ctx in [Ctx::Gui, Ctx::Terminal] {
+            let got = drive(kb, true, ctx, &crate::map::compile(kb, ctx, &cfg), &acts);
+            let keys: Vec<(u16, i32)> = got.iter().filter_map(|o| match o { Out::Key(c, v) => Some((*c, *v)), _ => None }).collect();
+            assert_eq!(keys, expected_keys, "kb={kb:?} ctx={ctx:?}");
+        }
+    }
+}
+
+#[test]
+fn active_ctx_resolution() {
+    use crate::engine::active_ctx;
+    assert_eq!(active_ctx(Some(Ctx::Terminal), Some(Ctx::Gui)), Ctx::Terminal, "explicit user override wins");
+    assert_eq!(active_ctx(None, Some(Ctx::Terminal)), Ctx::Terminal, "adapter report");
+    assert_eq!(active_ctx(None, None), Ctx::Gui, "desktop==GUI default (spec §8)");
+    assert_eq!(active_ctx(Some(Ctx::Gui), None), Ctx::Gui);
+}

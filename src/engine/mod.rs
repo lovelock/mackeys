@@ -40,6 +40,11 @@ pub struct DeviceState {
     down_keys: Vec<u16>,
 }
 
+/// Context resolution: explicit user override > adapter report > Gui (spec §8).
+pub fn active_ctx(user: Option<Ctx>, report: Option<Ctx>) -> Ctx {
+    user.or(report).unwrap_or(Ctx::Gui)
+}
+
 pub fn is_modifier(code: u16) -> bool {
     matches!(
         code,
