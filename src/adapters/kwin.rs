@@ -47,6 +47,16 @@ impl Notifier {
         *self.current.lock().unwrap() = Some(report.clone());
         let _ = self.tx.send(Some(report));
     }
+
+    /// Enquiry interface: what did the last focus report look like (faecal?
+    /// for doctor and user-side diagnostics: focus a window, run busctl).
+    async fn get_active_window(&self) -> (String, String, String) {
+        let report = self.current.lock().unwrap().clone();
+        match report {
+            Some(r) => (r.caption, r.resource_class, r.resource_name),
+            None => ("NO_DATA".into(), "NO_DATA".into(), "NO_DATA".into()),
+        }
+    }
 }
 
 impl KwinAdapter {

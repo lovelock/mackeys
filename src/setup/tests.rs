@@ -41,3 +41,11 @@ fn wants_debug_flag() {
     assert!(!super::wants_debug(&["run".into()]));
     assert!(!super::wants_debug(&["setup".into(), "--takeover".into()]));
 }
+
+#[test]
+fn doctor_helpers_groups() {
+    use super::groups_contains;
+    assert!(groups_contains("users wheel input", "input"));
+    assert!(!groups_contains("users wheel", "input"));
+    assert!(!groups_contains("", "input"));
+}

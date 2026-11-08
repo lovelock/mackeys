@@ -20,10 +20,6 @@ pub fn config_path() -> Result<std::path::PathBuf> {
     Ok(user_config_dir().join("mackeys/config.toml"))
 }
 
-/// Canonical user config dir, for doctor/service/etc.
-pub fn user_config_dir_pub() -> std::path::PathBuf {
-    user_config_dir()
-}
 
 pub const DEFAULT_CONFIG_TOML: &str = r#"# mackeys 配置 — 默认值即作者偏好，只写需要覆盖的项
 [general]
