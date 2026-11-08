@@ -1,5 +1,18 @@
 //! setup / doctor / service control. Tasks 1+8 (core plan).
 
+pub fn config_path() -> anyhow::Result<std::path::PathBuf> {
+    let dir = std::env::var("XDG_CONFIG_HOME")
+        .map(|h| std::path::PathBuf::from(h).join("mackeys"))
+        .unwrap_or_else(|_| {
+            dirs_home().map(|h| h.join(".config/mackeys")).unwrap_or_else(|| std::path::PathBuf::from("."))
+        });
+    Ok(dir.join("config.toml"))
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var("HOME").ok().map(std::path::PathBuf::from)
+}
+
 pub fn setup() -> anyhow::Result<()> {
     anyhow::bail!("setup lands with Task 8")
 }
