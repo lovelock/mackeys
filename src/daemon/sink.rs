@@ -19,24 +19,25 @@ use std::sync::mpsc;
 // ioctl plumbing (linux/uinput.h)
 // ---------------------------------------------------------------------------
 
-const fn _iorw_notype(nr: u16, is_write: bool) -> u64 {
-    // direction bit: 1=write(IOW) 2=read(IOR) — we only need IOW for setters
-    // and _IO (no direction) for create/destroy.
-    let dir: u64 = if is_write { 1 } else { 2 };
-    (dir << 30) | (nr as u64)
+/// _IOW('U', nr, int-style size with direction bits folded correctly)
+const fn ui_iow_set(nr: u16, payload_size: u64) -> u64 {
+    // _IOC_WRITE = 1
+    (1 << 30) | ((payload_size & 0x3fff) << 16) | ((b'U' as u64 & 0xff) << 8) | (nr as u64 & 0xff)
 }
-const fn _io(nr: u16) -> u64 {
-    nr as u64
+/// _IO('U', nr) — no direction, no payload size
+const fn ui_io_dev(nr: u16) -> u64 {
+    (b'U' as u64 & 0xff) << 8 | (nr as u64 & 0xff)
 }
 /// `_IOW('U', nr, int)` — payload size is `c_int` (4).
 const fn ui_set_evbit(nr: u16, payload_size: u64) -> u64 {
-    (3 << 30) | ((payload_size & 0x3fff) << 16) | ((b'U' as u64 & 0xff) << 8) | (nr as u64 & 0xff)
+    // _IOW: direction=1 (_IOC_WRITE)
+    (1 << 30) | ((payload_size & 0x3fff) << 16) | ((b'U' as u64 & 0xff) << 8) | (nr as u64 & 0xff)
 }
 
-const UI_SET_EVBIT: u64 = ui_set_evbit(100, 4);
-const UI_SET_KEYBIT: u64 = ui_set_evbit(101, 4);
-const UI_DEV_CREATE: u64 = _io(1);
-const UI_DEV_DESTROY: u64 = _io(2);
+const UI_SET_EVBIT: u64 = ui_iow_set(100, 4);
+const UI_SET_KEYBIT: u64 = ui_iow_set(101, 4);
+const UI_DEV_CREATE: u64 = ui_io_dev(1);
+const UI_DEV_DESTROY: u64 = ui_io_dev(2);
 
 const EV_KEY: u16 = 0x01;
 const EV_SYN: u16 = 0x00;
@@ -61,7 +62,9 @@ struct InputEvent {
 // uinput_user_dev is name[80] + input_id(4×u16) + ff_effects_max(u32) + the
 // abs/rel/led/rep/snd/sw coordinate arrays (zeroed = no axes configured).
 // We mirror byte-for-byte; sizes below match x86_64 + generic kernel.
-const UINPUT_USER_DEV_BYTES: usize = 80 + 8 + 4 + (4 * 4 * 64) + (4 * 1 * 32) + (4 * 4 * 16) + (4 * 2 * 16) + 4 + 4;
+// exact sizeof(struct uinput_user_dev): name[80] + input_id(8) +
+// ff_effects_max(4) + absmax/absmin/absfuzz/absflat (4 arrays × 64 × 4)
+const UINPUT_USER_DEV_BYTES: usize = 80 + 8 + 4 + (4 * 4 * 64);
 
 // ---------------------------------------------------------------------------
 // StallTracker — what to do when writes fail and when they recover
@@ -124,8 +127,9 @@ pub struct UInputWriter {
 impl UInputWriter {
     pub fn open() -> Result<Self> {
         unsafe {
+            let path_c = std::ffi::CString::new(UINPUT_PATH).unwrap();
             let fd = libc::open(
-                UINPUT_PATH.as_ptr() as *const libc::c_char,
+                path_c.as_ptr(),
                 libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
             );
             if fd < 0 {
