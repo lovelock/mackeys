@@ -1,17 +1,21 @@
-//! Daemon loop: input readers → engine → uinput sink, plus lifecycle.
+//! Daemon loop: input readers → engine → uinput sink, lifecycle, focus.
+//! The main loop is deliberately THIN: routing events only. Any slow work
+//! (device enumeration, adapter install) lives in background threads —
+//! incident 2026-11-08: a 16-minute main-loop block came from scan().
 
 pub mod devices;
+pub mod enumerator;
 pub mod input;
 mod sink;
 pub mod udevwatch;
 
+use enumerator::Enumerator;
 use input::LoopMsg;
-use crate::adapters::FocusSource;
-use std::sync::mpsc::{SyncSender, Sender};
 use sink::Sink;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::engine::{apply, shutdown, DeviceState};
 use crate::types::{Act, Ctx, Kb, Out, RuleSet};
@@ -21,16 +25,21 @@ use crate::types::{Act, Ctx, Kb, Out, RuleSet};
 pub struct AtomicCtx(pub std::sync::atomic::AtomicU8);
 impl AtomicCtx {
     pub fn get(&self) -> Ctx {
-        match self.0.load(Ordering::Relaxed) { 1 => Ctx::Terminal, _ => Ctx::Gui }
+        match self.0.load(Ordering::Relaxed) {
+            1 => Ctx::Terminal,
+            _ => Ctx::Gui,
+        }
     }
     pub fn set(&self, c: Ctx) {
         self.0.store(match c { Ctx::Terminal => 1, _ => 0 }, Ordering::Relaxed);
     }
 }
 
+const SCAN_FALLBACK_SECS: u64 = 60; // belt & suspenders when netlink is deaf
+const HEARTBEAT_SECS: u64 = 100; // wall-clock based on purpose
+
 /// Administrative entry for the `run` subcommand.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
-    // config load; absent file → whole-defaults (owner prefs baked into code)
     let cfg = match crate::map::config::load_config(&crate::setup::config_path()?) {
         Ok(c) => c,
         Err(e) => {
@@ -39,7 +48,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         }
     };
     if args.iter().any(|a| a == "--dry") {
-        let infos = devices::scan(&[])?;
+        let infos = devices::scan(&cfg.general.exclude_devices)?;
         println!("mackeys dry-run: device inventory:");
         for i in &infos {
             println!(
@@ -58,14 +67,12 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     };
     let swap = cfg.general.swap_caps_lctrl;
     let (gui, term) = crate::map::compile_all(kb, &cfg);
-    let per_device_kb: std::collections::BTreeMap<String, u8> = cfg
+    let per_device_kb: BTreeMap<String, u8> = cfg
         .per_device
         .iter()
-        .map(|(name, kind)| (
-            name.clone(),
-            match kind.as_str() { "apple" => 1, _ => 0 },
-        ))
+        .map(|(name, kind)| (name.clone(), match kind.as_str() { "apple" => 1, _ => 0 }))
         .collect();
+
     run_daemon(
         gui,
         term,
@@ -87,6 +94,8 @@ impl BoolExt for bool {
     }
 }
 
+/// NOTE: `per_device_kb` keys are device names; values: 1=apple 0=windows.
+#[allow(clippy::too_many_arguments)]
 pub fn run_daemon(
     rules_gui: RuleSet,
     rules_term: RuleSet,
@@ -94,51 +103,48 @@ pub fn run_daemon(
     adapter_name: String,
     default_kb: Kb,
     default_swap: bool,
-    per_device_kb: std::collections::BTreeMap<String, u8>,   // device name → kbtype byte
+    per_device_kb: BTreeMap<String, u8>,
     excludes: Vec<String>,
 ) -> anyhow::Result<()> {
     tracing::info!("mackeys daemon starting");
     let (tx, rx) = mpsc::channel::<LoopMsg>();
     let stop = Arc::new(AtomicBool::new(false));
     let ctx = Arc::new(AtomicCtx::default());
-    let cur_report: Arc<std::sync::Mutex<Option<crate::adapters::WindowReport>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let cur_report: Arc<Mutex<Option<crate::adapters::WindowReport>>> =
+        Arc::new(Mutex::new(None));
 
     // signal handling: SIGINT/SIGTERM set the stop flag; main loop observes it.
     signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone())?;
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone())?;
 
-    // focus adapter (replaceable component, spec §4).
-    // INSTALL MUST NOT KILL THE DAEMON (incident 2026-11-08: a boot-time
-    // KWin-not-ready window crash-looped the unit 19× and left the keyboard
-    // unmapped). Install retries in the background thread; key remapping
-    // runs immediately regardless of focus-report state.
-    let adapter: std::sync::Arc<dyn FocusSource> =
-        std::sync::Arc::from(crate::adapters::best_for(&adapter_name)?);
+    // device_kbs shared with the background enumerator
+    let device_kbs: Arc<Mutex<BTreeMap<u8, (Kb, bool)>>> = Arc::new(Mutex::new(Default::default()));
+    let enumerator = Enumerator::new(
+        tx.clone(),
+        excludes.clone(),
+        per_device_kb.clone(),
+        default_kb,
+        default_swap,
+        device_kbs.clone(),
+    );
+
+    // kernel uevent watcher — REAL device add/remove events
+    crate::daemon::udevwatch::spawn_watcher(tx.clone(), stop.clone())?;
+
+    // focus adapter (replaceable component, spec §4). Never fatal (incident:
+    // boot-time KWin-not-ready crash-loop left the keyboard unmapped).
+    let adapter: Arc<dyn crate::adapters::FocusSource> =
+        Arc::from(crate::adapters::best_for(&adapter_name)?);
     tracing::info!("focus adapter: {}", adapter.id());
     {
-        // bridge: focus reports → our loop. The relay thread may exist before
-        // the adapter watches — it just waits on the channel meanwhile.
-        let (sender, recvr) = mpsc::sync_channel::<Option<crate::adapters::WindowReport>>(16);
-        let i_tx = tx.clone();
-        std::thread::Builder::new()
-            .name("mackeys-focus-relay".into())
-            .spawn(move || {
-                for report in recvr {
-                    if i_tx.send(LoopMsg::Focus(report)).is_err() {
-                        break;
-                    }
-                }
-            })
-            .ok();
-
-        // installer retry loop: success → hand the sender to spawn_watch
         let a = adapter.clone();
+        let stop2 = stop.clone();
+        let i_tx2 = tx.clone();
         std::thread::Builder::new()
             .name("mackeys-adapter-install".into())
             .spawn(move || {
                 let mut delay = 2u64;
-                loop {
+                while !stop2.load(Ordering::Relaxed) {
                     match a.install() {
                         Ok(()) => break,
                         Err(e) => {
@@ -151,6 +157,19 @@ pub fn run_daemon(
                         }
                     }
                 }
+                if stop2.load(Ordering::Relaxed) { return; }
+                let (sender, recvr) =
+                    mpsc::sync_channel::<Option<crate::adapters::WindowReport>>(16);
+                std::thread::Builder::new()
+                    .name("mackeys-focus-relay".into())
+                    .spawn(move || {
+                        for report in recvr {
+                            if i_tx2.send(LoopMsg::Focus(report)).is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .ok();
                 if let Err(e) = a.spawn_watch(sender) {
                     tracing::error!(error = %e, "adapter watch failed after install");
                 }
@@ -158,71 +177,77 @@ pub fn run_daemon(
             .ok();
     }
 
-    // kernel uevent watcher — REAL device add/remove events (review after
-    // the 2026-11-08 freeze: the idle-branch rescan could go silent)
-    crate::daemon::udevwatch::spawn_watcher(tx.clone(), stop.clone())?;
-
-    // spawn readers for managed devices
-    let infos = devices::scan(&excludes)?;
-    let mut device_kbs = std::collections::BTreeMap::<u8, (Kb, bool)>::new();
-    let mut spawned: std::collections::BTreeMap<usize, std::path::PathBuf> = Default::default();
-    let mut tag_next = 0usize;
-    for i in &infos {
-        if !i.managed {
-            continue;
-        }
-        match input::spawn_reader(i.clone(), tag_next, tx.clone(), stop.clone()) {
-            Ok(_) => tracing::info!(name = %i.name, path = %i.path.display(), "grabbed"),
-            Err(e) => tracing::warn!(name = %i.name, error = %e, "grab failed — device stays native"),
-        }
-        let kb_byte = per_device_kb.get(&i.name).copied().unwrap_or_else(|| match default_kb { Kb::Apple => 1, _ => 0 });
-        let dev_kb = match kb_byte { 1 => Kb::Apple, _ => Kb::Windows };
-        device_kbs.insert(tag_next as u8, (dev_kb, default_swap));
-        spawned.insert(tag_next, i.path.clone());
-        tag_next += 1;
+    // initial enumeration runs in the background too (never blocks the loop)
+    {
+        let en = enumerator.clone();
+        std::thread::Builder::new()
+            .name("mackeys-enum-init".into())
+            .spawn(move || { en.scan_once(); })
+            .ok();
     }
-    let tx_rescan = tx.clone();
-    drop(tx);
 
     let mut sink = Sink::new()?;
     let mut states: BTreeMap<usize, DeviceState> = BTreeMap::new();
-    let terminal_classes_ref: std::sync::RwLock<Vec<String>> =
-        std::sync::RwLock::new(terminal_classes.clone());
     let mut sigtick = 0u64;
-    let mut acts_since_tick = 0u64;   // events received per heartbeat window
-    let mut sink_fail_streak = 0u64;
+    let mut next_heartbeat = Instant::now() + Duration::from_secs(HEARTBEAT_SECS);
+    let mut next_scan_fallback = Instant::now() + Duration::from_secs(SCAN_FALLBACK_SECS);
+    let mut acts_since_tick = 0u64;
+    let mut scan_fallback_count = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
-        let msg = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+        let now = Instant::now();
+        let timeout = std::cmp::min(next_heartbeat, next_scan_fallback)
+            .checked_duration_since(now)
+            .unwrap_or(Duration::from_millis(5));
+        let msg = match rx.recv_timeout(timeout) {
             Ok(m) => m,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // hotplug: low-frequency rescan grabs newly appeared devices
-                rescan_tick(&tx_rescan, &stop, &mut spawned, &mut tag_next, &excludes, &mut device_kbs, &per_device_kb, default_kb, default_swap);
-                continue;
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => LoopMsg::Rescan, // fallback semantics reused
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+
         match msg {
             LoopMsg::Rescan => {
-                rescan_tick(
-                    &tx_rescan, &stop, &mut spawned, &mut tag_next, &excludes,
-                    &mut device_kbs, &per_device_kb, default_kb, default_swap,
-                );
+                // periodic fallback: the netlink watcher covers real events;
+                // this branch fires when either deadline was reached
+                if now >= next_scan_fallback {
+                    scan_fallback_count += 1;
+                    tracing::debug!(count = scan_fallback_count, "scan fallback (netlink absent?)");
+                    next_scan_fallback = now + Duration::from_secs(SCAN_FALLBACK_SECS);
+                    let en = enumerator.clone();
+                    std::thread::Builder::new()
+                        .name("mackeys-enum-fallback".into())
+                        .spawn(move || { en.scan_once(); })
+                        .ok();
+                    continue;
+                }
+                // heartbeats are wall-clock anchored — a slow loop cannot
+                // postpone them (that is their raison d'être, incident above)
+                if now >= next_heartbeat {
+                    next_heartbeat = now + Duration::from_secs(HEARTBEAT_SECS);
+                    tracing::info!(
+                        keys = acts_since_tick,
+                        threads = std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or_default(),
+                        "heartbeat (100s wall-clock; keys>0 means events ARE arriving)"
+                    );
+                    acts_since_tick = 0;
+                    continue;
+                }
+                // unknown/knock request with both deadlines remote: no-op
             }
             LoopMsg::Focus(report) => {
-                if let Some(r) = &report { *cur_report.lock().unwrap() = Some(r.clone()); }
+                if let Some(r) = &report {
+                    *cur_report.lock().unwrap() = Some(r.clone());
+                }
                 let term = report
                     .as_ref()
-                    .map(|r| crate::adapters::is_terminal(r, &terminal_classes_ref.read().unwrap()))
-                    .unwrap_or(false);
+                    .map(|r| crate::adapters::is_terminal(r, &terminal_classes));
                 tracing::debug!(
                     app = report.as_ref().map(|r| format!("{} / {}", r.resource_class, r.resource_name)).unwrap_or_default(),
-                    is_terminal = term,
+                    is_terminal = ?term,
                     "FOCUS-report"
                 );
-                let newctx = if term { Ctx::Terminal } else { Ctx::Gui };
+                let newctx = if term.unwrap_or(false) { Ctx::Terminal } else { Ctx::Gui };
                 if ctx.get() != newctx {
-                    // context change: tear down held combos (spec §8 race rule)
                     for (tag, st) in states.iter_mut() {
                         let outv = crate::engine::release_held(st);
                         tracing::debug!(tag, cmds = outv.len(), "context switch teardown");
@@ -236,13 +261,20 @@ pub fn run_daemon(
             LoopMsg::Act(tag, act) => {
                 acts_since_tick += 1;
                 let ctx_now = ctx.get();
-                let rules = match ctx_now {
-                    Ctx::Terminal => &rules_term,
-                    _ => &rules_gui,
-                };
+                let rules = match ctx_now { Ctx::Terminal => &rules_term, _ => &rules_gui };
                 let state = states.entry(tag).or_default();
-                let (kb, swap) = device_kbs.get(&(tag as u8)).copied().unwrap_or((default_kb, default_swap));
-                let cur_app = cur_report.lock().unwrap().as_ref().map(|r| r.resource_class.clone()).or_else(|| cur_report.lock().unwrap().as_ref().map(|r| r.resource_name.clone()));
+                let (kb, swap) = device_kbs
+                    .lock()
+                    .unwrap()
+                    .get(&(tag as u8))
+                    .copied()
+                    .unwrap_or((default_kb, default_swap));
+                let cur_app = cur_report
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|r| r.resource_class.clone())
+                    .or_else(|| cur_report.lock().unwrap().as_ref().map(|r| r.resource_name.clone()));
                 let outv = apply(state, act, kb, swap, ctx_now, rules, cur_app.as_deref());
                 emit(&mut sink, outv);
             }
@@ -251,23 +283,8 @@ pub fn run_daemon(
                     emit(&mut sink, shutdown(&mut st));
                 }
                 states.remove(&tag);
-                spawned.remove(&tag);
-                device_kbs.remove(&(tag as u8));
-                tracing::info!(tag, "device reader ended; state flushed");
+                enumerator.release_tag(tag);
             }
-        }
-        // heartbeat: health visibility for "keyboard frozen" incidents
-        sigtick += 1;
-        if sigtick % 500 == 0 {
-            tracing::info!(
-                ticks = sigtick,
-                keys = acts_since_tick,
-                "heartbeat (500 idle ticks ≈ 100s; keys>0 means events ARE arriving)"
-            );
-            acts_since_tick = 0;
-        }
-        if sigtick % 500 == 0 && stop.load(Ordering::Relaxed) {
-            break;
         }
     }
 
@@ -279,41 +296,6 @@ pub fn run_daemon(
         emit(&mut sink, outv);
     }
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn rescan_tick(
-    tx: &mpsc::Sender<input::LoopMsg>,
-    stop: &Arc<AtomicBool>,
-    spawned: &mut std::collections::BTreeMap<usize, std::path::PathBuf>,
-    tag_next: &mut usize,
-    excludes: &[String],
-    device_kbs: &mut std::collections::BTreeMap<u8, (Kb, bool)>,
-    per_device_kb: &std::collections::BTreeMap<String, u8>,
-    default_kb: Kb,
-    default_swap: bool,
-) {
-    let Ok(infos) = devices::scan(excludes) else { return };
-    for i in infos.iter().filter(|i| i.managed) {
-        if spawned.values().any(|p| p == &i.path) {
-            continue;
-        }
-        let tag = *tag_next;
-        *tag_next += 1;
-        match input::spawn_reader(i.clone(), tag, tx.clone(), stop.clone()) {
-            Ok(()) => {
-                tracing::info!(name = %i.name, path = %i.path.display(), "hotplug: grabbed");
-                let kb_byte = per_device_kb.get(&i.name).copied().unwrap_or_else(|| match default_kb { Kb::Apple => 1, _ => 0 });
-                let dev_kb = match kb_byte { 1 => Kb::Apple, _ => Kb::Windows };
-                device_kbs.insert(tag as u8, (dev_kb, default_swap));
-                spawned.insert(tag, i.path.clone());
-            }
-            Err(e) => {
-                // un-spawn (user velho devices without grab stay native; untracked)
-                tracing::debug!(name = %i.name, error = %e, "hotplug grab refused");
-            }
-        }
-    }
 }
 
 fn emit(sink: &mut Sink, outv: Vec<Out>) {
@@ -334,4 +316,9 @@ fn emit(sink: &mut Sink, outv: Vec<Out>) {
             }
         }
     }
+}
+
+#[allow(dead_code)]
+enum _Keep {
+    _ActMarker(usize, Act),
 }

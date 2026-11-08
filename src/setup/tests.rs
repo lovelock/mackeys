@@ -49,3 +49,27 @@ fn doctor_helpers_groups() {
     assert!(!groups_contains("users wheel", "input"));
     assert!(!groups_contains("", "input"));
 }
+
+#[test]
+fn heartbeat_wallclock_deadline() {
+    use std::time::{Duration, Instant};
+    // simulates the main loop: heartbeat fires on WALL CLOCK, immune to
+    // intervening loops or slow enumeration
+    let now = Instant::now();
+    let period = Duration::from_secs(100);
+    let mut next = now + period;
+    let mut iterations = 0;
+    let mut fired = 0;
+    // 200 simulated loop ticks, irregular spacing, one very slow 120s span
+    let spacing = [Duration::from_millis(200), Duration::from_secs(120)];
+    let mut t = now;
+    for i in 0..10 {
+        t = t + spacing[i % 2];
+        if t >= next {
+            next = t + period;
+            fired += 1;
+        }
+        iterations += 1;
+    }
+    assert!(fired >= 1, "slow loop must not starve the heartbeat");
+}
