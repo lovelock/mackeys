@@ -93,6 +93,16 @@ impl KwinAdapter {
         }
         Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string()))
     }
+
+    /// Ground-truth loaded check (shared with doctor via pure query).
+    pub fn script_loaded(&self) -> bool {
+        matches!(
+            self.kwin_dbus_call("isScriptLoaded", Some(SCRIPT_ID))
+                .ok()
+                .and_then(|s| s.map(|out| out.to_lowercase().contains("true"))),
+            Some(true)
+        )
+    }
 }
 
 impl super::FocusSource for KwinAdapter {
@@ -107,30 +117,44 @@ impl super::FocusSource for KwinAdapter {
         std::fs::write(code_dir.join("main.js"), SCRIPT_MAIN)?;
 
         // Enable persistently (Toshy knowledge: dbus loadScript alone doesn't
-        // START the script; kwinrc Plugins.<id>Enabled=true + reconfigure does)
+        // START the script; kwinrc Plugins.<Id>Enabled=true + reconfigure does)
+        let enabled_key = super::kwinrc_enabled_key(SCRIPT_ID); // "mackeys-focusEnabled"
         for kw in ["kwriteconfig6", "kwriteconfig5"] {
             let _ = std::process::Command::new(kw)
-                .args(["--file", "kwinrc", "--group", "Plugins", "--key", "mackeysFocusEnabled", "true"])
+                .args(["--file", "kwinrc", "--group", "Plugins", "--key", &enabled_key, "true"])
+                .output();
+            // retire the legacy camelCase stray key from earlier releases (C3)
+            let _ = std::process::Command::new(kw)
+                .args(["--file", "kwinrc", "--group", "Plugins", "--key", "mackeysFocusEnabled", "--delete"])
                 .output();
         }
+
         // dbus loadScript(s) is a path-based no-op (review C3): kwinrc
         // Enabled=true + reconfigure is the load path that actually works
         let _ = self.kwin_dbus_call("reconfigure", None);
-        for _ in 0..5 {
-            std::thread::sleep(std::time::Duration::from_millis(700));
-            let loaded = self.kwin_dbus_call("isScriptLoaded", Some(SCRIPT_ID))?;
-            if loaded.map(|s| s.to_lowercase().contains("true")).unwrap_or(false) {
-                tracing::info!("kwin adapter: script installed & loaded ({}).", SCRIPT_ID);
-                return Ok(());
-            }
+
+        // At boot KWin itself may still be initializing long after
+        // graphical-session.target — poll generously, never bail the daemon
+        // early (incident 2026-11-08: 5×700ms crash-looped the unit 19×).
+        let loaded_ok = super::poll_until(
+            12,
+            std::time::Duration::from_millis(1500),
+            || self.script_loaded(),
+        );
+        if loaded_ok {
+            tracing::info!("kwin adapter: script installed & loaded ({}).", SCRIPT_ID);
+            return Ok(());
         }
-        anyhow::bail!("kwin script installed but did not report loaded — may need a relogin")
+        Err(anyhow::anyhow!(
+            "kwin script did not report loaded within poll window — daemon keeps retrying in background"
+        ))
     }
     fn uninstall(&self) -> Result<()> {
         let _ = self.kwin_dbus_call("unloadScript", Some(SCRIPT_ID));
+        let enabled_key = super::kwinrc_enabled_key(SCRIPT_ID);
         for kw in ["kwriteconfig6", "kwriteconfig5"] {
             let _ = std::process::Command::new(kw)
-                .args(["--file", "kwinrc", "--group", "Plugins", "--key", "mackeysFocusEnabled", "false"])
+                .args(["--file", "kwinrc", "--group", "Plugins", "--key", &enabled_key, "false"])
                 .output();
         }
         let dir = self.script_dir()?;

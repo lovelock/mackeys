@@ -105,16 +105,19 @@ pub fn run_daemon(
     signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone())?;
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone())?;
 
-    // focus adapter (replaceable component, spec §4)
+    // focus adapter (replaceable component, spec §4).
+    // INSTALL MUST NOT KILL THE DAEMON (incident 2026-11-08: a boot-time
+    // KWin-not-ready window crash-looped the unit 19× and left the keyboard
+    // unmapped). Install retries in the background thread; key remapping
+    // runs immediately regardless of focus-report state.
     let adapter: std::sync::Arc<dyn FocusSource> =
         std::sync::Arc::from(crate::adapters::best_for(&adapter_name)?);
     tracing::info!("focus adapter: {}", adapter.id());
-    adapter.install()?;
     {
-        // focus reports bridge into our loop through a relay thread
+        // bridge: focus reports → our loop. The relay thread may exist before
+        // the adapter watches — it just waits on the channel meanwhile.
         let (sender, recvr) = mpsc::sync_channel::<Option<crate::adapters::WindowReport>>(16);
         let i_tx = tx.clone();
-        let classes = terminal_classes.clone();
         std::thread::Builder::new()
             .name("mackeys-focus-relay".into())
             .spawn(move || {
@@ -125,8 +128,31 @@ pub fn run_daemon(
                 }
             })
             .ok();
-        let adapter_for_watch: std::sync::Arc<dyn FocusSource> = std::sync::Arc::from(adapter);
-        adapter_for_watch.spawn_watch(sender)?;
+
+        // installer retry loop: success → hand the sender to spawn_watch
+        let a = adapter.clone();
+        std::thread::Builder::new()
+            .name("mackeys-adapter-install".into())
+            .spawn(move || {
+                let mut delay = 2u64;
+                loop {
+                    match a.install() {
+                        Ok(()) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "adapter install failed — key remap already live; retrying in {delay}s"
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(delay));
+                            delay = (delay * 2).min(30);
+                        }
+                    }
+                }
+                if let Err(e) = a.spawn_watch(sender) {
+                    tracing::error!(error = %e, "adapter watch failed after install");
+                }
+            })
+            .ok();
     }
 
     // spawn readers for managed devices

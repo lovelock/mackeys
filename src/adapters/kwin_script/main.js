@@ -16,7 +16,12 @@ function notifyMackeys(window){
 }
 
 workspace.windowActivated.connect(notifyMackeys);
-// periodic re-report of the CURRENT focus (review I3): daemon restarts,
-// config reloads and relogin all get a fresh context without kickstart.
-//5s interval keeps stale-terminal contexts from lingering.
-offerInterval = setInterval(function(){ notifyMackeys(workspace.activeWindow); }, 5000);
+
+// Fresh report at script activation (KWin runs this on load AND on every
+// reconfigure). The daemon's adapter install retry loop reconfigures until
+// it succeeds, so after a daemon or session restart the current focus is
+// reported exactly once, without needing timers (QJSEngine has none:
+// calling setInterval here throws and kills the script — incident 2026-11-08).
+if (typeof workspace.activeWindow !== "undefined") {
+    notifyMackeys(workspace.activeWindow);
+}
