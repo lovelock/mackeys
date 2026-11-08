@@ -183,7 +183,9 @@ pub fn run_daemon(
     let mut states: BTreeMap<usize, DeviceState> = BTreeMap::new();
     let terminal_classes_ref: std::sync::RwLock<Vec<String>> =
         std::sync::RwLock::new(terminal_classes.clone());
-    let mut sigtick = 0;
+    let mut sigtick = 0u64;
+    let mut acts_since_tick = 0u64;   // events received per heartbeat window
+    let mut sink_fail_streak = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
         let msg = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
@@ -221,6 +223,7 @@ pub fn run_daemon(
                 }
             }
             LoopMsg::Act(tag, act) => {
+                acts_since_tick += 1;
                 let ctx_now = ctx.get();
                 let rules = match ctx_now {
                     Ctx::Terminal => &rules_term,
@@ -242,8 +245,16 @@ pub fn run_daemon(
                 tracing::info!(tag, "device reader ended; state flushed");
             }
         }
-        // safety valve: observe stop even under busy traffic
+        // heartbeat: health visibility for "keyboard frozen" incidents
         sigtick += 1;
+        if sigtick % 500 == 0 {
+            tracing::info!(
+                ticks = sigtick,
+                keys = acts_since_tick,
+                "heartbeat (500 idle ticks ≈ 100s; keys>0 means events ARE arriving)"
+            );
+            acts_since_tick = 0;
+        }
         if sigtick % 500 == 0 && stop.load(Ordering::Relaxed) {
             break;
         }
@@ -295,9 +306,21 @@ fn rescan_tick(
 }
 
 fn emit(sink: &mut Sink, outv: Vec<Out>) {
+    static FAIL_STREAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
     for o in outv {
-        if let Err(e) = sink.emit(o) {
-            tracing::warn!(error = %e, "sink emit failed");
+        match sink.emit(o) {
+            Ok(()) => {
+                if FAIL_STREAK.swap(0, Ordering::Relaxed) > 0 {
+                    tracing::info!("sink recovered after failures");
+                }
+            }
+            Err(e) => {
+                let n = FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n == 5 || n % 20 == 0 {
+                    tracing::error!(error = %e, failures = n, "uinput sink write failing — if this persists the whole keyboard is mute (grabbed, no output)");
+                }
+            }
         }
     }
 }

@@ -44,7 +44,7 @@ pub fn spawn_reader(
     std::thread::Builder::new()
         .name(format!("mackeys-reader-{}", info.name))
         .spawn(move || {
-            loop {
+            'outer: loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -56,17 +56,23 @@ pub fn spawn_reader(
                             }
                             let act = Act { code: ev.code(), value: ev.value() };
                             if tx.send(LoopMsg::Act(tag, act)).is_err() {
-                                break;
+                                tracing::warn!(tag, "main loop gone — reader exiting");
+                                break 'outer;
                             }
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
-                    Err(_) => break, // device vanished (hotplug / suspend)
+                    Err(e) => {
+                        tracing::warn!(tag, error = %e, "reader stream error — device lost (hotplug/suspend)");                        break;
+                    }
                 }
             }
-            let _ = dev.ungrab(); // release before close
+            match dev.ungrab() {
+                Ok(()) => tracing::debug!(tag, "ungrab ok"),
+                Err(e) => tracing::warn!(tag, error = %e, "ungrab failed (device already gone — ENODEV expected on hardware unplug)"),
+            }
             let _ = tx.send(LoopMsg::Eof(tag));
         })?;
     Ok(())
