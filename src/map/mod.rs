@@ -29,6 +29,7 @@ pub fn compile(kb: crate::types::Kb, ctx: crate::types::Ctx, cfg: &Config) -> cr
                 context: ctx,
                 input,
                 output,
+                apps: ur.apps.clone(),
             });
         }
     }

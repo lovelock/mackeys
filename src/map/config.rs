@@ -73,6 +73,9 @@ pub struct UserRule {
     pub output: String,
     #[serde(default = "default_any")]
     pub context: String,
+    /// App-scope tokens (resourceClass/name contains, case-insensitive)
+    #[serde(default)]
+    pub apps: Option<Vec<String>>,
 }
 
 fn default_any() -> String {

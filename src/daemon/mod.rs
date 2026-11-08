@@ -100,6 +100,8 @@ pub fn run_daemon(
     let (tx, rx) = mpsc::channel::<LoopMsg>();
     let stop = Arc::new(AtomicBool::new(false));
     let ctx = Arc::new(AtomicCtx::default());
+    let cur_report: Arc<std::sync::Mutex<Option<crate::adapters::WindowReport>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     // signal handling: SIGINT/SIGTERM set the stop flag; main loop observes it.
     signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone())?;
@@ -195,6 +197,7 @@ pub fn run_daemon(
         };
         match msg {
             LoopMsg::Focus(report) => {
+                if let Some(r) = &report { *cur_report.lock().unwrap() = Some(r.clone()); }
                 let term = report
                     .as_ref()
                     .map(|r| crate::adapters::is_terminal(r, &terminal_classes_ref.read().unwrap()))
@@ -225,7 +228,8 @@ pub fn run_daemon(
                 };
                 let state = states.entry(tag).or_default();
                 let (kb, swap) = device_kbs.get(&(tag as u8)).copied().unwrap_or((default_kb, default_swap));
-                let outv = apply(state, act, kb, swap, ctx_now, rules);
+                let cur_app = cur_report.lock().unwrap().as_ref().map(|r| r.resource_class.clone()).or_else(|| cur_report.lock().unwrap().as_ref().map(|r| r.resource_name.clone()));
+                let outv = apply(state, act, kb, swap, ctx_now, rules, cur_app.as_deref());
                 emit(&mut sink, outv);
             }
             LoopMsg::Eof(tag) => {

@@ -2,6 +2,7 @@
 
 pub mod doctor;
 pub mod service;
+pub mod vscode;
 
 use anyhow::Result;
 
@@ -91,6 +92,10 @@ pub fn uinput_ok(mode: &str, user_in_input_group: bool) -> (bool, String) {
     }
 }
 
+pub fn user_config_dir_pub() -> std::path::PathBuf {
+    user_config_dir()
+}
+
 fn user_config_dir() -> std::path::PathBuf {
     if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
         if !x.is_empty() {
@@ -137,7 +142,21 @@ pub fn setup_with(args: &[String]) -> Result<()> {
 }
 
 fn do_setup(dry: bool, takeover: bool) -> Result<()> {
+    let no_vscode = std::env::args().any(|a| a == "--no-vscode");
     println!("mackeys setup{}", if dry { " (dry-run)" } else { "" });
+    if no_vscode {
+        println!("vscode integration skipped (--no-vscode)");
+    }
+    if !no_vscode {
+        let xdg = user_config_dir();
+        let affected = vscode::apply(&xdg, dry)?;
+        if dry {
+            println!("would inject vscode integration ({affected:?})");
+        } else {
+            println!("vscode integration applied: {affected:?}");
+            println!("  撤销：`mackeys vscode --revert` 或删除标记块（详见 README）");
+        }
+    }
 
     // 1. config template (idempotent)
     let cfg_path = user_config_dir().join("mackeys/config.toml");
@@ -215,6 +234,10 @@ fn takeover_toshy() {
     }
 }
 
+pub fn vscode_cli(args: &[String]) -> Result<()> {
+    vscode::cli(args)
+}
+
 pub fn doctor() -> Result<()> {
     doctor::run()?;
     Ok(())
@@ -236,6 +259,7 @@ pub fn uninstall() -> Result<()> {
     if let Ok(adapter) = crate::adapters::best_for("auto") {
         let _ = adapter.uninstall();
     }
+    let _ = vscode::revert(&user_config_dir());
     let unit = user_config_dir().join("systemd/user/mackeys.service");
     if unit.exists() {
         std::fs::remove_file(&unit)?;

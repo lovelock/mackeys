@@ -42,6 +42,10 @@ pub struct Combo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutputSel {
     Combo(Combo),
+    /// Macro: emit each combo transiently, in order, on the trigger press
+    /// (Toshy use-case: the Electron Alt-F19 hack for VSCode wordwise).
+    /// Kernel autorepeats of the trigger replay the sequence.
+    Seq(Vec<Combo>),
     /// Swallow the key entirely (e.g. Cmd+H).
     Ignore,
     /// Matches but emits nothing special — identical to no rule matching.
@@ -57,6 +61,9 @@ pub struct Rule {
     pub context: Ctx,
     pub input: Combo,
     pub output: OutputSel,
+    /// Restrict to focus reports whose resourceClass/name contains ANY of
+    /// these tokens (case-insensitive). None = any app.
+    pub apps: Option<Vec<String>>,
 }
 
 /// Ordered rule set; index 0 has the highest priority.

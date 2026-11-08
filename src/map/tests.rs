@@ -81,6 +81,7 @@ fn compile_orders_users_first_and_honors_disable() {
             input: "cmd+w".into(),
             output: "ignore".into(),
             context: "gui".into(),
+            apps: None,
         }],
     };
     let gui = crate::map::compile(Kb::Windows, Ctx::Gui, &cfg);

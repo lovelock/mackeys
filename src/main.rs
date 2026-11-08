@@ -11,7 +11,7 @@ mod types;
 
 use anyhow::Result;
 
-const SUBCOMMANDS: &str = "run (default) | setup | doctor | start | stop | status | devices | dump | uninstall";
+const SUBCOMMANDS: &str = "run (default) | setup | doctor | start | stop | status | devices | dump | vscode | uninstall";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -32,6 +32,7 @@ fn main() -> Result<()> {
         "start" | "stop" | "status" => setup::service_ctl(&sub),
         "devices" => setup::devices(),
         "dump" => map::dump(),
+        "vscode" => setup::vscode_cli(&args[1..]),
         "uninstall" => setup::uninstall(),
         "help" | "--help" | "-h" => {
             println!("mackeys — macOS-style keymap daemon for Linux");

@@ -22,6 +22,10 @@ pub const BUILTIN_IDS: &[&str] = &[
     "term_cmd_letters",
     "term_cmd_nums",
     "term_cmd_arrows",
+    // VSCode hybrid family (app-scoped: editor + embedded terminal in one window)
+    "vsc_grave",
+    "vsc_shift_grave",
+    "vsc_cmd_dot",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +63,7 @@ fn rule(
             key: Some(input_key),
         },
         output,
+        apps: None,
     }
 }
 
@@ -181,5 +186,26 @@ pub fn build_builtins(kb: Kb, context: Ctx, launcher: &LauncherSpec) -> Vec<Rule
             v.push(rule("wordwise_opt_right", context, m(&opt), 106, OutputSel::Combo(Combo { mods: m(&[29]), key: Some(106) })));
         }
     }
+    // ---- VSCode hybrid family: app-scoped (Toshy "VSCodes" keymap port) ----
+    let vsc_apps = vec!["code".to_string(), "code-oss".to_string(), "vscodium".to_string()];
+    let vsc = |context: Ctx| -> Vec<Rule> {
+        // Cmd+` → Ctrl+` : toggle the embedded terminal
+        let mut v2 = vec![
+            rule("vsc_grave", context, m(&cmd), 41,
+                 OutputSel::Combo(Combo { mods: m(&[29]), key: Some(41) })),
+            rule("vsc_shift_grave", context, m(&cmdshift), 41,
+                 OutputSel::Combo(Combo { mods: m(&[29, 42]), key: Some(41) })),
+            // Cmd+. → Ctrl+. : QuickFix (the injected keybindings.json turns
+            // Ctrl+. with terminalFocus into the SIGINT sequence instead)
+            rule("vsc_cmd_dot", context, m(&cmd), 52,
+                 OutputSel::Combo(Combo { mods: m(&[29]), key: Some(52) })),
+        ];
+        for r in &mut v2 {
+            r.apps = Some(vsc_apps.clone());
+        }
+        v2
+    };
+    v.extend(vsc(Ctx::Gui));
+    v.extend(vsc(Ctx::Terminal));
     v
 }

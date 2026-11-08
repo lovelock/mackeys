@@ -18,6 +18,12 @@ struct Keyst {
     out_code: u16,
 }
 
+#[derive(Debug, Clone)]
+struct SeqState {
+    in_code: u16,
+    seq: Vec<Combo>,
+}
+
 #[derive(Debug)]
 struct HeldCombo {
     key_in: u16,
@@ -36,6 +42,8 @@ pub struct DeviceState {
     /// If a rule with Ignore matched, its key's release is swallowed too
     /// (until the same key releases, or any other event happens).
     pending_ignored: Option<u16>,
+    /// Sequence-output memory: (in_code, seq) so kernel autorepeats replay it.
+    last_seq: Option<SeqState>,
     /// Output-side keys currently believed pressed (down) — incl. passthrough.
     down_keys: Vec<u16>,
 }
@@ -122,10 +130,16 @@ fn process_inner(
     swap_caps: bool,
     ctx: Ctx,
     rules: &RuleSet,
+    app: Option<&str>,
 ) -> Vec<Out> {
     let km = code_map(kb, swap_caps);
     let out_code = km(act.code);
     tracing::debug!(physical = act.code, value = act.value, out = out_code, "KEY");
+
+    if is_modifier(out_code) || act.value == 0 {
+        // modifier events + key releases never replay a sequence
+        state.last_seq = None;
+    }
 
     if is_modifier(out_code) && act.value != 2 {
         return match act.value {
@@ -201,7 +215,7 @@ fn process_inner(
                 .rules
                 .iter()
                 .enumerate()
-                .find(|(_i, r)| r.context == ctx && matches_combo(&r.input, &held_outs, out_code));
+                .find(|(_i, r)| r.context == ctx && matches_app(&r.apps, app) && matches_combo(&r.input, &held_outs, out_code));
 
             match matched.map(|(idx, r)| (&r.output, r.sticky, r.id.as_str())) {
                 Some((OutputSel::Ignore, _, r_id)) => {
@@ -288,6 +302,27 @@ fn process_inner(
                     });
                     outv
                 }
+                Some((OutputSel::Seq(seqCombos), ..)) => {
+                    // release held/pressed output mods to keep the sequence clean
+                    let held_outs_now: Vec<u16> = state
+                        .held
+                        .iter()
+                        .map(|k| k.out_code)
+                        .collect();
+                    for om in &held_outs_now {
+                        if !state.auto_released.contains(om) {
+                            outv.push(Out::Key(*om, 0));
+                            state.mark_auto_released(*om);
+                        }
+                    }
+                    outv.extend(emit_seq(seqCombos));
+                    outv.push(Out::Sync);
+                    state.last_seq = Some(SeqState {
+                        in_code: out_code,
+                        seq: seqCombos.clone(),
+                    });
+                    outv
+                }
                 Some((OutputSel::Pass, ..)) | None => {
                     // resume auto-released mods, then emit the key
                     for m in std::mem::take(&mut state.auto_released) {
@@ -315,6 +350,35 @@ fn process_inner(
             vec![Out::Key(out_code, 0), Out::Sync]
         }
     }
+}
+
+/// App-scoped rules only fire when the focus report's resourceClass/name
+/// contains any of their tokens (case-insensitive). None report → never.
+fn matches_app(apps: &Option<Vec<String>>, app: Option<&str>) -> bool {
+    let Some(list) = apps else { return true };
+    let Some(app) = app else { return false };
+    let hay = app.to_lowercase();
+    list.iter().any(|t| hay.contains(&t.to_lowercase()))
+}
+
+/// Emit a Seq output: for each combo — mods down, key down/up, mods up.
+/// Transient by design; caller handles autorepeat replay + own-mod release.
+fn emit_seq(seq: &[Combo]) -> Vec<Out> {
+    let mut outv = Vec::new();
+    for c in seq {
+        for m in &c.mods {
+            outv.push(Out::Key(*m, 1));
+        }
+        if let Some(k) = c.key {
+            outv.push(Out::Key(k, 1));
+            outv.push(Out::Key(k, 0));
+        }
+        for m in c.mods.iter().rev() {
+            outv.push(Out::Key(*m, 0));
+        }
+        outv.push(Out::Sync);
+    }
+    outv
 }
 
 fn matches_combo(input: &Combo, held_outs: &[u16], key: u16) -> bool {
@@ -368,6 +432,7 @@ pub fn release_ignored(state: &mut DeviceState, mods: &[u16]) -> Vec<Out> {
 }
 
 /// Public entry: drops kernel-autorepeat events, tracks pressed output keys.
+#[allow(clippy::too_many_arguments)]
 pub fn apply(
     state: &mut DeviceState,
     act: Act,
@@ -375,11 +440,19 @@ pub fn apply(
     swap_caps: bool,
     ctx: Ctx,
     rules: &RuleSet,
+    app: Option<&str>,
 ) -> Vec<Out> {
     if act.value == 2 {
-        return vec![]; // kernel autorepeat — compositor drives repeat (spec §8)
+        // kernel autorepeat — compositor drives repeat for held output keys
+        // (spec §8); but Seq outputs can't "hold": replay the sequence instead
+        if let Some(seq_state) = &state.last_seq {
+            if seq_state.in_code == act.code {
+                return emit_seq(&seq_state.seq);
+            }
+        }
+        return vec![];
     }
-    let outv = process_inner(state, act, kb, swap_caps, ctx, rules);
+    let outv = process_inner(state, act, kb, swap_caps, ctx, rules, app);
     for out in &outv {
         match out {
             Out::Key(c, 1) => {

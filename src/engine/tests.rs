@@ -23,10 +23,21 @@ fn drive(
     rules: &RuleSet,
     acts: &[Act],
 ) -> Vec<super::Out> {
+    drive_app(kb, swap, ctx, None, rules, acts)
+}
+
+fn drive_app(
+    kb: Kb,
+    swap: bool,
+    ctx: Ctx,
+    app: Option<&str>,
+    rules: &RuleSet,
+    acts: &[Act],
+) -> Vec<super::Out> {
     let mut st = DeviceState::default();
     let mut out = Vec::new();
     for a in acts {
-        out.extend(apply(&mut st, *a, kb, swap, ctx, rules));
+        out.extend(apply(&mut st, *a, kb, swap, ctx, rules, app));
     }
     out
 }
@@ -35,8 +46,8 @@ fn drive(
 fn shutdown_releases_tracked_and_ends_with_release_all() {
     let mut st = DeviceState::default();
     // hold cmd (physical 56), press+hold Z
-    apply(&mut st, act(56, 1), Kb::Windows, true, Ctx::Gui, &RuleSet::default());
-    apply(&mut st, act(44, 1), Kb::Windows, true, Ctx::Gui, &RuleSet::default());
+    apply(&mut st, act(56, 1), Kb::Windows, true, Ctx::Gui, &RuleSet::default(), None);
+    apply(&mut st, act(44, 1), Kb::Windows, true, Ctx::Gui, &RuleSet::default(), None);
     let out = shutdown(&mut st);
     assert!(out.contains(&Out::Key(44, 0)), "held combo key released");
     assert!(out.contains(&Out::Key(97, 0)), "held output mod released");
@@ -125,6 +136,7 @@ fn repeats_dropped() {
                 true,
                 Ctx::Gui,
                 &RuleSet::default(),
+                None,
             )
         };
         assert!(got.is_empty(), "value=2 events must vanish");
@@ -137,6 +149,7 @@ fn repeats_dropped() {
                 true,
                 Ctx::Gui,
                 &RuleSet::default(),
+                None,
             )
         };
         assert!(got.is_empty(), "modifier repeats must vanish too");
@@ -179,6 +192,7 @@ fn ignore_swallows_and_releases() {
         sticky: false,
         context: Ctx::Gui,
         input: combo(&[97], Some(35)),
+        apps: None,
         output: OutputSel::Ignore,
     }]);
     let acts = [
@@ -265,6 +279,7 @@ fn combo_rule_stream_shape() {
         sticky: false,
         context: Ctx::Gui,
         input: combo(&[97], Some(46)),
+        apps: None,
         output: OutputSel::Combo(combo(&[97], Some(46))),
     }]);
     let acts = [
@@ -400,8 +415,8 @@ fn release_held_keeps_bound_sticky_releases_combo_key() {
     let cfg = crate::map::config::Config::parse_toml("").expect("default config");
     let rules = crate::map::compile(Kb::Windows, Ctx::Gui, &cfg);
     let mut st = DeviceState::default();
-    apply(&mut st, act(56, 1), Kb::Windows, true, Ctx::Gui, &rules);
-    apply(&mut st, act(15, 1), Kb::Windows, true, Ctx::Gui, &rules);
+    apply(&mut st, act(56, 1), Kb::Windows, true, Ctx::Gui, &rules, None);
+    apply(&mut st, act(15, 1), Kb::Windows, true, Ctx::Gui, &rules, None);
     let out = super::release_held(&mut st);
     assert!(out.contains(&Out::Key(15, 0)), "combo key released");
     assert!(
@@ -409,7 +424,7 @@ fn release_held_keeps_bound_sticky_releases_combo_key() {
         "bound sticky mod untouched by release_held"
     );
     // later cmd release still releases the bound output
-    let out2 = apply(&mut st, act(56, 0), Kb::Windows, true, Ctx::Gui, &rules);
+    let out2 = apply(&mut st, act(56, 0), Kb::Windows, true, Ctx::Gui, &rules, None);
     assert!(
         out2.iter().any(|e| matches!(e, Out::Key(56, 0))),
         "bound mod released on input release"
@@ -460,10 +475,68 @@ fn default_config_terminal_classes_reach_terminal_ctx() {
     // engine path: with ctx=Terminal resolved from that report, cmd+c is shift-protected
     let rules = crate::map::compile(Kb::Windows, Ctx::Terminal, &cfg);
     let mut st = DeviceState::default();
-    let _ = apply(&mut st, act(56, 1), Kb::Windows, true, Ctx::Terminal, &rules);
-    let out = apply(&mut st, act(46, 1), Kb::Windows, true, Ctx::Terminal, &rules);
+    let _ = apply(&mut st, act(56, 1), Kb::Windows, true, Ctx::Terminal, &rules, None);
+    let out = apply(&mut st, act(46, 1), Kb::Windows, true, Ctx::Terminal, &rules, None);
     assert!(
         out.iter().any(|e| matches!(e, Out::Key(42, 1))),
         "shift must be synthesized in terminal ctx (SIGINT protection)"
     );
+}
+
+// ---- T10: per-app rules + Seq output (VSCode hybrid feature) ----
+#[test]
+fn app_scoped_rules_only_match_matching_app() {
+    let rules = RuleSet {
+        rules: vec![Rule {
+            id: "vsc_grave".into(),
+            builtin: true,
+            sticky: false,
+            context: Ctx::Gui,
+            input: combo(&[97], Some(41)),
+            apps: Some(vec!["code".into(), "vscodium".into()]),
+            output: OutputSel::Combo(combo(&[29], Some(41))),
+        }],
+    };
+    let got = drive_app(Kb::Windows, true, Ctx::Gui, Some("firefox"), &rules, &[
+        act(56, 1), act(41, 1), act(41, 0), act(56, 0),
+    ]);
+    assert!(!got.iter().any(|e| matches!(e, Out::Key(29, 1))), "firefox must not get ctrl+grave");
+    let got = drive_app(Kb::Windows, true, Ctx::Gui, Some("code"), &rules, &[
+        act(56, 1), act(41, 1), act(41, 0), act(56, 0),
+    ]);
+    assert!(got.iter().any(|e| matches!(e, Out::Key(29, 1))), "vscode gets ctrl+grave");
+    let got = drive_app(Kb::Windows, true, Ctx::Gui, Some("Code - Insiders"), &rules, &[
+        act(56, 1), act(41, 1),
+    ]);
+    assert!(got.iter().any(|e| matches!(e, Out::Key(29, 1))));
+}
+
+#[test]
+fn seq_output_emits_and_replays() {
+    let seq = vec![combo(&[97], Some(75)), combo(&[29], Some(105))];
+    let rules = RuleSet {
+        rules: vec![Rule {
+            id: "vsc_wordwise_left".into(),
+            builtin: true,
+            sticky: false,
+            context: Ctx::Gui,
+            input: combo(&[97], Some(105)),
+            apps: Some(vec!["code".into()]),
+            output: OutputSel::Seq(seq),
+        }],
+    };
+    let mut st = DeviceState::default();
+    let got: Vec<Out> = super::apply(&mut st, act(56, 1), Kb::Windows, true, Ctx::Gui, &rules, Some("code"));
+    assert!(got.contains(&Out::Key(97, 1)));
+    let got: Vec<Out> = super::apply(&mut st, act(105, 1), Kb::Windows, true, Ctx::Gui, &rules, Some("code"));
+    let pressed = got.iter().filter(|e| matches!(e, Out::Key(_, 1))).count();
+    assert!(got.contains(&Out::Key(97, 0)), "own mod released before sequence");
+    assert!(got.contains(&Out::Key(105, 1)), "wordwise output emitted");
+    assert!(pressed >= 4);
+    let got2: Vec<Out> = super::apply(&mut st, act(105, 2), Kb::Windows, true, Ctx::Gui, &rules, Some("code"));
+    assert!(got2.contains(&Out::Key(105, 1)), "repeat replays sequence");
+    let got3: Vec<Out> = super::apply(&mut st, act(30, 1), Kb::Windows, true, Ctx::Gui, &rules, Some("code"));
+    assert!(got3.contains(&Out::Key(30, 1)));
+    let got4: Vec<Out> = super::apply(&mut st, act(30, 2), Kb::Windows, true, Ctx::Gui, &rules, Some("code"));
+    assert!(got4.is_empty(), "plain repeats dropped");
 }
