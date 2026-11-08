@@ -3,6 +3,7 @@
 pub mod devices;
 pub mod input;
 mod sink;
+pub mod udevwatch;
 
 use input::LoopMsg;
 use crate::adapters::FocusSource;
@@ -157,6 +158,10 @@ pub fn run_daemon(
             .ok();
     }
 
+    // kernel uevent watcher — REAL device add/remove events (review after
+    // the 2026-11-08 freeze: the idle-branch rescan could go silent)
+    crate::daemon::udevwatch::spawn_watcher(tx.clone(), stop.clone())?;
+
     // spawn readers for managed devices
     let infos = devices::scan(&excludes)?;
     let mut device_kbs = std::collections::BTreeMap::<u8, (Kb, bool)>::new();
@@ -198,6 +203,12 @@ pub fn run_daemon(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match msg {
+            LoopMsg::Rescan => {
+                rescan_tick(
+                    &tx_rescan, &stop, &mut spawned, &mut tag_next, &excludes,
+                    &mut device_kbs, &per_device_kb, default_kb, default_swap,
+                );
+            }
             LoopMsg::Focus(report) => {
                 if let Some(r) = &report { *cur_report.lock().unwrap() = Some(r.clone()); }
                 let term = report

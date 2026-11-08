@@ -13,6 +13,8 @@ pub enum LoopMsg {
     /// device disappeared — main loop drops its state
     Eof(usize),
     Focus(Option<crate::adapters::WindowReport>), // full report; bool computed at consumer
+    /// kernel uevent says devices changed → rescan_tick
+    Rescan,
 }
 
 pub struct ReaderHandle {
