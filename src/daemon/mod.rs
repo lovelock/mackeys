@@ -119,13 +119,10 @@ pub fn run_daemon(
             .name("mackeys-focus-relay".into())
             .spawn(move || {
                 for report in recvr {
-            let term = report
-                .as_ref()
-                .map(|r| crate::adapters::is_terminal(r, &classes));
-            if i_tx.send(LoopMsg::Focus(term)).is_err() {
-                break;
-            }
-        }
+                    if i_tx.send(LoopMsg::Focus(report)).is_err() {
+                        break;
+                    }
+                }
             })
             .ok();
         let adapter_for_watch: std::sync::Arc<dyn FocusSource> = std::sync::Arc::from(adapter);
@@ -156,6 +153,8 @@ pub fn run_daemon(
 
     let mut sink = Sink::new()?;
     let mut states: BTreeMap<usize, DeviceState> = BTreeMap::new();
+    let terminal_classes_ref: std::sync::RwLock<Vec<String>> =
+        std::sync::RwLock::new(terminal_classes.clone());
     let mut sigtick = 0;
 
     while !stop.load(Ordering::Relaxed) {
@@ -169,8 +168,17 @@ pub fn run_daemon(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match msg {
-            LoopMsg::Focus(term) => {
-                let newctx = if term.unwrap_or(false) { Ctx::Terminal } else { Ctx::Gui };
+            LoopMsg::Focus(report) => {
+                let term = report
+                    .as_ref()
+                    .map(|r| crate::adapters::is_terminal(r, &terminal_classes_ref.read().unwrap()))
+                    .unwrap_or(false);
+                tracing::debug!(
+                    app = report.as_ref().map(|r| format!("{} / {}", r.resource_class, r.resource_name)).unwrap_or_default(),
+                    is_terminal = term,
+                    "FOCUS-report"
+                );
+                let newctx = if term { Ctx::Terminal } else { Ctx::Gui };
                 if ctx.get() != newctx {
                     // context change: tear down held combos (spec §8 race rule)
                     for (tag, st) in states.iter_mut() {
@@ -178,7 +186,8 @@ pub fn run_daemon(
                         tracing::debug!(tag, cmds = outv.len(), "context switch teardown");
                         emit(&mut sink, outv);
                     }
-                    tracing::info!(kind = if newctx == Ctx::Terminal { "terminal" } else { "gui" }, "context change");
+                    let app = report.as_ref().map(|r| r.resource_class.clone()).unwrap_or_default();
+                    tracing::info!(kind = if newctx == Ctx::Terminal { "terminal" } else { "gui" }, app, "context change");
                     ctx.set(newctx);
                 }
             }

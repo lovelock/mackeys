@@ -12,7 +12,7 @@ pub enum LoopMsg {
     Act(usize, Act),
     /// device disappeared — main loop drops its state
     Eof(usize),
-    Focus(Option<bool>), // Some(is_terminal)
+    Focus(Option<crate::adapters::WindowReport>), // full report; bool computed at consumer
 }
 
 pub struct ReaderHandle {
