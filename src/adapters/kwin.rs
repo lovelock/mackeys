@@ -96,17 +96,32 @@ impl super::FocusSource for KwinAdapter {
         std::fs::write(dir.join("metadata.json"), SCRIPT_NAME_META)?;
         std::fs::write(code_dir.join("main.js"), SCRIPT_MAIN)?;
 
-        // loadScript is idempotent-safe: check loaded state first
-        let loaded = self.kwin_dbus_call("isScriptLoaded", Some(SCRIPT_ID))?;
-        if !loaded.map(|s| s.to_lowercase().contains("true")).unwrap_or(false) {
-            self.kwin_dbus_call("loadScript", Some(SCRIPT_ID))?;
+        // Enable persistently (Toshy knowledge: dbus loadScript alone doesn't
+        // START the script; kwinrc Plugins.<id>Enabled=true + reconfigure does)
+        for kw in ["kwriteconfig6", "kwriteconfig5"] {
+            let _ = std::process::Command::new(kw)
+                .args(["--file", "kwinrc", "--group", "Plugins", "--key", "mackeysFocusEnabled", "true"])
+                .output();
         }
+        self.kwin_dbus_call("loadScript", Some(SCRIPT_ID))?;
         let _ = self.kwin_dbus_call("reconfigure", None);
-        tracing::info!("kwin adapter: script installed & loaded ({}).", SCRIPT_ID);
-        Ok(())
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            let loaded = self.kwin_dbus_call("isScriptLoaded", Some(SCRIPT_ID))?;
+            if loaded.map(|s| s.to_lowercase().contains("true")).unwrap_or(false) {
+                tracing::info!("kwin adapter: script installed & loaded ({}).", SCRIPT_ID);
+                return Ok(());
+            }
+        }
+        anyhow::bail!("kwin script installed but did not report loaded — may need a relogin")
     }
     fn uninstall(&self) -> Result<()> {
         let _ = self.kwin_dbus_call("unloadScript", Some(SCRIPT_ID));
+        for kw in ["kwriteconfig6", "kwriteconfig5"] {
+            let _ = std::process::Command::new(kw)
+                .args(["--file", "kwinrc", "--group", "Plugins", "--key", "mackeysFocusEnabled", "false"])
+                .output();
+        }
         let dir = self.script_dir()?;
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
