@@ -12,7 +12,7 @@ pub const R_ALT: u16 = 100;
 pub const R_META: u16 = 126;
 
 /// Physically-held modifier mapping input physical code -> output code.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 struct Keyst {
     in_code: u16,
     out_code: u16,
@@ -147,11 +147,33 @@ fn process_inner(
                     .retain(|k| !(k.in_code == act.code && k.out_code == out_code));
                 let was_released = state.auto_released.contains(&out_code);
                 state.auto_released.retain(|c| *c != out_code);
-                if was_released {
-                    // already released silently (Ignore / combo teardown) — stay silent
-                    return vec![];
+                let mut outv = Vec::new();
+                if !was_released {
+                    outv.push(Out::Key(out_code, 0));
                 }
-                vec![Out::Key(out_code, 0), Out::Sync]
+                // bound (sticky) pairs: input release carries the bound output,
+                // unless an active held combo still needs that output mod down
+                let in_combo = |bout: u16, state: &DeviceState| -> bool {
+                    state
+                        .held_combo
+                        .as_ref()
+                        .map(|h| h.out_pressed.contains(&bout))
+                        .unwrap_or(false)
+                };
+                let mut released_bound = Vec::new();
+                for (bin, bout) in state.bound.clone() {
+                    if bin == act.code && !in_combo(bout, state) {
+                        released_bound.push(bout);
+                        outv.push(Out::Key(bout, 0));
+                    }
+                }
+                state
+                    .bound
+                    .retain(|b| !(b.0 == act.code && released_bound.contains(&b.1)));
+                if !outv.is_empty() {
+                    outv.push(Out::Sync);
+                }
+                outv
             }
         };
     }
@@ -168,18 +190,15 @@ fn process_inner(
             let matched = rules
                 .rules
                 .iter()
-                .find(|r| r.context == ctx && matches_combo(&r.input, &held_outs, out_code));
+                .enumerate()
+                .find(|(_i, r)| r.context == ctx && matches_combo(&r.input, &held_outs, out_code));
 
-            match matched.map(|r| (&r.output, r.id.as_str())) {
-                Some((OutputSel::Ignore, _)) => {
+            match matched.map(|(r_id, r)| (&r.output, r.sticky, r.id.as_str())) {
+                Some((OutputSel::Ignore, _, _)) => {
                     // swallow + release own output mods (they stay auto-released
                     // so the later physical release is silent)
                     state.pending_ignored = Some(out_code);
-                    if let Some(r) = rules
-                        .rules
-                        .iter()
-                        .find(|r| r.context == ctx && matches_combo(&r.input, &held_outs, out_code))
-                    {
+                    if let Some((_, r)) = matched {
                         for m in &r.input.mods {
                             if held_outs.contains(m) {
                                 outv.push(Out::Key(*m, 0));
@@ -190,16 +209,32 @@ fn process_inner(
                     outv.push(Out::Sync);
                     outv
                 }
-                Some((OutputSel::Combo(c), _)) => {
+                Some((OutputSel::Combo(c), is_sticky, _)) => {
+                    // release "own" output mods the output combo doesn't hold
+                    let held_outs_now = state.held.clone();
+                    let outs_held: Vec<u16> = held_outs_now
+                        .iter()
+                        .filter(|k| !state.auto_released.contains(&k.out_code))
+                        .map(|k| k.out_code)
+                        .collect();
+                    for om in &outs_held {
+                        if !c.mods.contains(om) {
+                            outv.push(Out::Key(*om, 0));
+                            state.mark_auto_released(*om);
+                        }
+                    }
                     let mut pressed = Vec::new();
                     for m in &c.mods {
-                        if state
-                            .held
+                        // sticky binding: bind the input modifier that produced
+                        // (or holds) this output mod, so its release carries it
+                        let binder_in = held_outs_now
                             .iter()
-                            .any(|k| k.out_code == *m)
-                            && !state.auto_released.contains(m)
-                            && !pressed.contains(m)
-                        {
+                            .find(|k| k.out_code == *m && !state.auto_released.contains(&k.out_code))
+                            .map(|k| k.in_code);
+                        if let Some(kin) = binder_in {
+                            if is_sticky && !state.bound.contains(&(kin, *m)) {
+                                state.bound.push((kin, *m));
+                            }
                             continue; // already down
                         }
                         if pressed.contains(m) {
@@ -207,17 +242,34 @@ fn process_inner(
                         }
                         outv.push(Out::Key(*m, 1));
                         pressed.push(*m);
+                        if is_sticky {
+                            // fresh-pressed output mod binds to the input mod
+                            // that started the combo (auto_sticky semantics)
+                            let first_in = matched
+                                .and_then(|(_, rule)| {
+                                    state.held.iter().find(|k| k.out_code == rule.input.mods[0]).map(|k| k.in_code)
+                                });
+                            if let Some(first_in) = first_in {
+                                if !state.bound.contains(&(first_in, *m)) {
+                                    state.bound.push((first_in, *m));
+                                }
+                            }
+                        }
                     }
                     outv.push(Out::Key(out_code, 1));
                     outv.push(Out::Sync);
+                    let filtered_pressed: Vec<u16> = pressed
+                        .into_iter()
+                        .filter(|m| !state.bound.iter().any(|(_, o)| o == m))
+                        .collect();
                     state.held_combo = Some(HeldCombo {
                         key_in: out_code,
                         out: c.clone(),
-                        out_pressed: pressed,
+                        out_pressed: filtered_pressed,
                     });
                     outv
                 }
-                Some((OutputSel::Pass, _)) | None => {
+                Some((OutputSel::Pass, ..)) | None => {
                     // resume auto-released mods, then emit the key
                     for m in std::mem::take(&mut state.auto_released) {
                         outv.push(Out::Key(m, 1));
@@ -324,6 +376,24 @@ pub fn apply(
             _ => {}
         }
     }
+    outv
+}
+
+/// Release the active held combo's key (context-switch path). Sticky bound
+/// output mods are NOT touched here — their owning input will release them.
+pub fn release_held(state: &mut DeviceState) -> Vec<Out> {
+        let Some(h) = state.held_combo.take() else {
+        return vec![];
+    };
+    let mut outv = vec![Out::Key(h.key_in, 0)];
+    for m in h.out_pressed {
+        if state.bound.iter().any(|(_, o)| o == &m) {
+            continue; // bound mod released by its input owner
+        }
+        outv.push(Out::Key(m, 0));
+        state.mark_auto_released(m);
+    }
+    outv.push(Out::Sync);
     outv
 }
 

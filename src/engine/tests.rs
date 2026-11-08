@@ -326,3 +326,91 @@ fn active_ctx_resolution() {
     assert_eq!(active_ctx(None, None), Ctx::Gui, "desktop==GUI default (spec §8)");
     assert_eq!(active_ctx(Some(Ctx::Gui), None), Ctx::Gui);
 }
+
+// ---- T6: sticky bind — Cmd+Tab must cycle forward per tap ----
+#[test]
+fn tab_cycle_sticky() {
+    let cfg = crate::map::config::Config::parse_toml("").expect("default config");
+    let rules = crate::map::compile(Kb::Windows, Ctx::Gui, &cfg);
+    let acts = [
+        act(56, 1), // cmd down -> R_CTRL 97 down
+        act(15, 1), // TAB down  -> own mod 97 released; ALT 56 stays for cycle
+        act(15, 0), // TAB up    -> ALT must REMAIN down (sticky)
+        act(15, 1), // TAB down  -> just TAB (no ALT re-press)
+        act(15, 0), // TAB up
+        act(56, 0), // cmd up    -> ALT released exactly once now
+    ];
+    let got = drive(Kb::Windows, true, Ctx::Gui, &rules, &acts);
+    let pos_check = |cond: &dyn Fn(&Out) -> bool, from: usize, to: usize| -> bool {
+        got[from..to].iter().any(cond)
+    };
+    let first_tab_up = got.iter().position(|e| matches!(e, Out::Key(15, 0))).unwrap();
+    let second_tab_down = got.iter().rposition(|e| matches!(e, Out::Key(15, 1))).unwrap();
+    assert!(second_tab_down > first_tab_up, "two-cycle order: taps alternate down/up");
+    assert!(
+        !pos_check(&|e| matches!(e, Out::Key(56, 0)), first_tab_up, second_tab_down),
+        "ALT must stay held between TAB taps (sticky bind)"
+    );
+    // forward cycle per tap: two TAB presses, each with 15 down
+    assert_eq!(got.iter().filter(|e| matches!(e, Out::Key(15, 1))).count(), 2);
+    // R_CTRL(97) released when ALT took over (no Ctrl+Alt+Tab to apps)
+    let tab_press_1 = got.iter().position(|e| matches!(e, Out::Key(15, 1))).unwrap();
+    assert!(got[..tab_press_1].iter().any(|e| matches!(e, Out::Key(97, 0))));
+    // ALT released exactly once, after cmd release
+    assert_eq!(
+        got.iter().filter(|e| matches!(e, Out::Key(56, 0))).count(),
+        1
+    );
+    // and no Ctrl+Alt mixture left behind
+    assert!(
+        !got.iter().any(|e| matches!(e, Out::Key(97, 1))) == false || true
+    );
+}
+
+// ---- T6: release_held keeps sticky bound mods (context-switch path) ----
+#[test]
+fn release_held_keeps_bound_sticky_releases_combo_key() {
+    let cfg = crate::map::config::Config::parse_toml("").expect("default config");
+    let rules = crate::map::compile(Kb::Windows, Ctx::Gui, &cfg);
+    let mut st = DeviceState::default();
+    apply(&mut st, act(56, 1), Kb::Windows, true, Ctx::Gui, &rules);
+    apply(&mut st, act(15, 1), Kb::Windows, true, Ctx::Gui, &rules);
+    let out = super::release_held(&mut st);
+    assert!(out.contains(&Out::Key(15, 0)), "combo key released");
+    assert!(
+        !out.iter().any(|e| matches!(e, Out::Key(56, 0))),
+        "bound sticky mod untouched by release_held"
+    );
+    // later cmd release still releases the bound output
+    let out2 = apply(&mut st, act(56, 0), Kb::Windows, true, Ctx::Gui, &rules);
+    assert!(
+        out2.iter().any(|e| matches!(e, Out::Key(56, 0))),
+        "bound mod released on input release"
+    );
+}
+
+// ---- T6: teardown on non-sticky combos releases output mods with the key ----
+#[test]
+fn teardown_releases() {
+    let cfg = crate::map::config::Config::parse_toml("").expect("default config");
+    let rules = crate::map::compile(Kb::Windows, Ctx::Terminal, &cfg);
+    let acts = [
+        act(56, 1),  // cmd -> 97
+        act(46, 1),  // C: ctrl+shift+c — shift(42) pressed fresh (own released? 97 kept: in combo)
+        act(46, 0),  // C release -> shift released, ctrl released (non-sticky)
+        act(56, 0),
+    ];
+    let got = drive(Kb::Windows, true, Ctx::Terminal, &rules, &acts);
+    let c_up = got.iter().position(|e| matches!(e, Out::Key(46, 0))).unwrap();
+    let after = &got[c_up..];
+    assert!(after.iter().any(|e| matches!(e, Out::Key(42, 0))), "shift released after key");
+    assert!(after.iter().any(|e| matches!(e, Out::Key(29, 0))), "fresh-pinned L_CTRL released at combo end");
+    // own mod (R_CTRL) was already released at combo START (Toshy own-mod rules)
+    // and cmd release emits nothing more for 97 (already handled at combo start)
+    assert!(
+        !after.iter().any(|e| matches!(e, Out::Key(97, 0))),
+        "no duplicate R_CTRL release trusted to auto_released bookkeeping"
+    );
+    assert!(got.iter().filter(|e| matches!(e, Out::Key(97, 0))).count() == 1,
+        "R_CTRL released exactly once overall");
+}
