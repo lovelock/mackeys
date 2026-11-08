@@ -75,6 +75,15 @@ impl DeviceState {
             .collect()
     }
 
+    /// ALL output codes belonging to physically-held input modifiers —
+    /// auto_released entries INCLUDED. Rule matching must use this pool:
+    /// a sticky-released own mod (e.g. Cmd held while Alt takes over) is
+    /// still *input-side* held, and repeat taps must keep matching
+    /// (Toshy transform.py:424-428 semantics — the C1 lesson).
+    fn held_input_outs(&self) -> Vec<u16> {
+        self.held.iter().map(|k| k.out_code).collect()
+    }
+
     fn stop_combo(&mut self) -> Vec<Out> {
         let Some(h) = self.held_combo.take() else {
             return vec![];
@@ -186,7 +195,7 @@ fn process_inner(
             let mut outv = teardown; // (rare path; keeps output sane)
             state.pending_ignored = None;
 
-            let held_outs = state.held_outs();
+            let held_outs = state.held_input_outs(); // match pool: input-held, incl. auto_released (C1)
             let matched = rules
                 .rules
                 .iter()
@@ -210,7 +219,9 @@ fn process_inner(
                     outv
                 }
                 Some((OutputSel::Combo(c), is_sticky, _)) => {
-                    // release "own" output mods the output combo doesn't hold
+                    // release "own" output mods that are PRESSED but absent
+                    // from the output combo (auto_released stay untouched —
+                    // they were already released and must NOT emit again)
                     let held_outs_now = state.held.clone();
                     let outs_held: Vec<u16> = held_outs_now
                         .iter()
@@ -225,6 +236,11 @@ fn process_inner(
                     }
                     let mut pressed = Vec::new();
                     for m in &c.mods {
+                        // already-bound sticky output is still DOWN (its input
+                        // mod owns it); skip re-press, keep bind (C1 fix)
+                        if state.bound.iter().any(|(_b, o)| o == m) {
+                            continue;
+                        }
                         // sticky binding: bind the input modifier that produced
                         // (or holds) this output mod, so its release carries it
                         let binder_in = held_outs_now

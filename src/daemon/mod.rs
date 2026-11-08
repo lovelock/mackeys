@@ -73,6 +73,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         kb,
         swap,
         per_device_kb,
+        cfg.general.exclude_devices.clone(),
     )
 }
 
@@ -93,6 +94,7 @@ pub fn run_daemon(
     default_kb: Kb,
     default_swap: bool,
     per_device_kb: std::collections::BTreeMap<String, u8>,   // device name → kbtype byte
+    excludes: Vec<String>,
 ) -> anyhow::Result<()> {
     tracing::info!("mackeys daemon starting");
     let (tx, rx) = mpsc::channel::<LoopMsg>();
@@ -131,8 +133,9 @@ pub fn run_daemon(
     }
 
     // spawn readers for managed devices
-    let infos = devices::scan(&[])?;
+    let infos = devices::scan(&excludes)?;
     let mut device_kbs = std::collections::BTreeMap::<u8, (Kb, bool)>::new();
+    let mut spawned: std::collections::BTreeMap<usize, std::path::PathBuf> = Default::default();
     let mut tag_next = 0usize;
     for i in &infos {
         if !i.managed {
@@ -145,8 +148,10 @@ pub fn run_daemon(
         let kb_byte = per_device_kb.get(&i.name).copied().unwrap_or_else(|| match default_kb { Kb::Apple => 1, _ => 0 });
         let dev_kb = match kb_byte { 1 => Kb::Apple, _ => Kb::Windows };
         device_kbs.insert(tag_next as u8, (dev_kb, default_swap));
+        spawned.insert(tag_next, i.path.clone());
         tag_next += 1;
     }
+    let tx_rescan = tx.clone();
     drop(tx);
 
     let mut sink = Sink::new()?;
@@ -156,7 +161,11 @@ pub fn run_daemon(
     while !stop.load(Ordering::Relaxed) {
         let msg = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(m) => m,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // hotplug: low-frequency rescan grabs newly appeared devices
+                rescan_tick(&tx_rescan, &stop, &mut spawned, &mut tag_next, &excludes, &mut device_kbs, &per_device_kb, default_kb, default_swap);
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match msg {
@@ -189,6 +198,8 @@ pub fn run_daemon(
                     emit(&mut sink, shutdown(&mut st));
                 }
                 states.remove(&tag);
+                spawned.remove(&tag);
+                device_kbs.remove(&(tag as u8));
                 tracing::info!(tag, "device reader ended; state flushed");
             }
         }
@@ -207,6 +218,41 @@ pub fn run_daemon(
         emit(&mut sink, outv);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rescan_tick(
+    tx: &mpsc::Sender<input::LoopMsg>,
+    stop: &Arc<AtomicBool>,
+    spawned: &mut std::collections::BTreeMap<usize, std::path::PathBuf>,
+    tag_next: &mut usize,
+    excludes: &[String],
+    device_kbs: &mut std::collections::BTreeMap<u8, (Kb, bool)>,
+    per_device_kb: &std::collections::BTreeMap<String, u8>,
+    default_kb: Kb,
+    default_swap: bool,
+) {
+    let Ok(infos) = devices::scan(excludes) else { return };
+    for i in infos.iter().filter(|i| i.managed) {
+        if spawned.values().any(|p| p == &i.path) {
+            continue;
+        }
+        let tag = *tag_next;
+        *tag_next += 1;
+        match input::spawn_reader(i.clone(), tag, tx.clone(), stop.clone()) {
+            Ok(()) => {
+                tracing::info!(name = %i.name, path = %i.path.display(), "hotplug: grabbed");
+                let kb_byte = per_device_kb.get(&i.name).copied().unwrap_or_else(|| match default_kb { Kb::Apple => 1, _ => 0 });
+                let dev_kb = match kb_byte { 1 => Kb::Apple, _ => Kb::Windows };
+                device_kbs.insert(tag as u8, (dev_kb, default_swap));
+                spawned.insert(tag, i.path.clone());
+            }
+            Err(e) => {
+                // un-spawn (user velho devices without grab stay native; untracked)
+                tracing::debug!(name = %i.name, error = %e, "hotplug grab refused");
+            }
+        }
+    }
 }
 
 fn emit(sink: &mut Sink, outv: Vec<Out>) {

@@ -103,7 +103,8 @@ impl super::FocusSource for KwinAdapter {
                 .args(["--file", "kwinrc", "--group", "Plugins", "--key", "mackeysFocusEnabled", "true"])
                 .output();
         }
-        self.kwin_dbus_call("loadScript", Some(SCRIPT_ID))?;
+        // dbus loadScript(s) is a path-based no-op (review C3): kwinrc
+        // Enabled=true + reconfigure is the load path that actually works
         let _ = self.kwin_dbus_call("reconfigure", None);
         for _ in 0..5 {
             std::thread::sleep(std::time::Duration::from_millis(700));

@@ -34,7 +34,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# mackeys 配置 — 默认值即作者
 # exclude_devices = ["Gaming Keyboard"] # 按名排除设备
 
 [targets]
-# terminal_classes = ["^konsole", "ghostty", "alacritty", "kitty", "wezterm", "foot"]
+terminal_classes = ["^konsole", "ghostty", "alacritty", "kitty", "wezterm", "foot"]
 
 [launcher]
 # cmd_space = "alt+space"               # Cmd+Space 去哪儿；"none" = 吞键
@@ -106,13 +106,20 @@ fn user_config_dir() -> std::path::PathBuf {
 }
 
 pub fn in_group(group: &str) -> bool {
-    let ids = std::fs::read_to_string("/etc/group").unwrap_or_default();
-    ids.lines().any(|l| {
-        let mut it = l.split(':');
-        let name = it.next().unwrap_or("");
-        let members = it.nth(2).unwrap_or("");
-        name == group && !members.is_empty()
-    })
+    // review I4: /etc/group membership strings are not evidence — ask the
+    // kernel what groups the CURRENT user actually has (incl. primary group)
+    let out = std::process::Command::new("id")
+        .args(["-Gn"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    groups_contains(&out, group)
+}
+
+/// pure: does `groups` (id -Gn style whitespace list) contain group?
+pub fn groups_contains(groups: &str, group: &str) -> bool {
+    groups.split_whitespace().any(|g| g == group)
 }
 
 // ---------------- CLI ----------------

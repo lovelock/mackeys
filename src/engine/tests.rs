@@ -361,10 +361,37 @@ fn tab_cycle_sticky() {
         got.iter().filter(|e| matches!(e, Out::Key(56, 0))).count(),
         1
     );
-    // and no Ctrl+Alt mixture left behind
+    // second tab tap must NOT re-press R_CTRL (that would be Ctrl+Tab)
     assert!(
-        !got.iter().any(|e| matches!(e, Out::Key(97, 1))) == false || true
+        !pos_check(&|e| matches!(e, Out::Key(97, 1)), first_tab_up, second_tab_down),
+        "2nd tab tap must NOT synthesize Ctrl+Tab (C1)"
     );
+    // and after the whole run, exactly one R_CTRL press (at cmd down) — no res on repeat taps
+    assert_eq!(got.iter().filter(|e| matches!(e, Out::Key(97, 1))).count(), 1);
+}
+
+#[test]
+fn double_tap_cmd_space_never_makes_ctrl_space() {
+    // C1 regression pin: 2nd Cmd+Space press must not synthesize Ctrl+Space
+    let cfg = crate::map::config::Config::parse_toml("").expect("default config");
+    let rules = crate::map::compile(Kb::Windows, Ctx::Gui, &cfg);
+    let acts = [
+        act(56, 1),  // cmd -> 97
+        act(57, 1), act(57, 0),  // Space tap ok
+        act(57, 1), act(57, 0),  // 2nd tap
+        act(56, 0),
+    ];
+    let got = drive(Kb::Windows, true, Ctx::Gui, &rules, &acts);
+    for w in got.windows(2) {
+        assert!(
+            !(matches!(w[0], Out::Key(97, 1)) && matches!(w[1], Out::Key(57, 1))),
+            "Ctrl+Space synthesized! (C1 regression)"
+        );
+    }
+    // strong assertion: no 97 press at all except at cmd down
+    assert_eq!(got.iter().filter(|e| matches!(e, Out::Key(97, 1))).count(), 1, "R_CTRL never re-pressed on repeat taps");
+    // and every space tap produced exactly one space press
+    assert_eq!(got.iter().filter(|e| matches!(e, Out::Key(57, 1))).count(), 2);
 }
 
 // ---- T6: release_held keeps sticky bound mods (context-switch path) ----
@@ -413,4 +440,30 @@ fn teardown_releases() {
     );
     assert!(got.iter().filter(|e| matches!(e, Out::Key(97, 0))).count() == 1,
         "R_CTRL released exactly once overall");
+}
+
+// ---- C2 regression: default config reaches Terminal for konsole ----
+#[test]
+fn default_config_terminal_classes_reach_terminal_ctx() {
+    use crate::adapters::{is_terminal, WindowReport};
+    let cfg = crate::map::config::Config::parse_toml("").expect("empty TOML = full defaults");
+    assert!(
+        !cfg.targets.terminal_classes.is_empty(),
+        "Targets::default must carry the spec §3.2 list"
+    );
+    let konsole = WindowReport {
+        caption: "zsh".into(),
+        resource_class: "org.kde.Konsole".into(),
+        resource_name: "zsh".into(),
+    };
+    assert!(is_terminal(&konsole, &cfg.targets.terminal_classes));
+    // engine path: with ctx=Terminal resolved from that report, cmd+c is shift-protected
+    let rules = crate::map::compile(Kb::Windows, Ctx::Terminal, &cfg);
+    let mut st = DeviceState::default();
+    let _ = apply(&mut st, act(56, 1), Kb::Windows, true, Ctx::Terminal, &rules);
+    let out = apply(&mut st, act(46, 1), Kb::Windows, true, Ctx::Terminal, &rules);
+    assert!(
+        out.iter().any(|e| matches!(e, Out::Key(42, 1))),
+        "shift must be synthesized in terminal ctx (SIGINT protection)"
+    );
 }

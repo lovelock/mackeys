@@ -16,5 +16,7 @@ function notifyMackeys(window){
 }
 
 workspace.windowActivated.connect(notifyMackeys);
-// initial sweep so the daemon has a context right after (re)load
-workspace.windowList().forEach(notifyMackeys);
+// periodic re-report of the CURRENT focus (review I3): daemon restarts,
+// config reloads and relogin all get a fresh context without kickstart.
+//5s interval keeps stale-terminal contexts from lingering.
+offerInterval = setInterval(function(){ notifyMackeys(workspace.activeWindow); }, 5000);

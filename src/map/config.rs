@@ -38,10 +38,25 @@ impl Default for General {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Targets {
     pub terminal_classes: Vec<String>,
+}
+
+impl Default for Targets {
+    /// Spec §3.2 default: omitting the key means the spec default list, not none.
+    fn default() -> Self {
+        Self {
+            terminal_classes: [
+                "^konsole", "ghostty", "alacritty", "kitty", "wezterm",
+                "org.wezfurlong.wezterm", "foot", "rio",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
