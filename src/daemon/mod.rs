@@ -29,6 +29,14 @@ impl AtomicCtx {
 
 /// Administrative entry for the `run` subcommand.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
+    // config load; absent file → whole-defaults (owner prefs baked into code)
+    let cfg = match crate::map::config::load_config(&crate::setup::config_path()?) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error=%e, "config not loaded — using defaults (run `mackeys setup`)");
+            crate::map::config::Config::parse_toml("")?
+        }
+    };
     if args.iter().any(|a| a == "--dry") {
         let infos = devices::scan(&[])?;
         println!("mackeys dry-run: device inventory:");
@@ -43,7 +51,29 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         println!("(no grabs performed in dry mode)");
         return Ok(());
     }
-    run_daemon(Kb::Windows, true, RuleSet::default(), vec![])
+    let kb = match cfg.general.kbtype_default.as_str() {
+        "apple" => Kb::Apple,
+        _ => Kb::Windows,
+    };
+    let swap = cfg.general.swap_caps_lctrl;
+    let (gui, term) = crate::map::compile_all(kb, &cfg);
+    let per_device_kb: std::collections::BTreeMap<String, u8> = cfg
+        .per_device
+        .iter()
+        .map(|(name, kind)| (
+            name.clone(),
+            match kind.as_str() { "apple" => 1, _ => 0 },
+        ))
+        .collect();
+    run_daemon(
+        gui,
+        term,
+        cfg.targets.terminal_classes.clone(),
+        cfg.general.adapter.clone(),
+        kb,
+        swap,
+        per_device_kb,
+    )
 }
 
 trait BoolExt {
@@ -56,10 +86,13 @@ impl BoolExt for bool {
 }
 
 pub fn run_daemon(
-    kb: Kb,
-    swap_caps: bool,
-    rules: RuleSet,
+    rules_gui: RuleSet,
+    rules_term: RuleSet,
     terminal_classes: Vec<String>,
+    adapter_name: String,
+    default_kb: Kb,
+    default_swap: bool,
+    per_device_kb: std::collections::BTreeMap<String, u8>,   // device name → kbtype byte
 ) -> anyhow::Result<()> {
     tracing::info!("mackeys daemon starting");
     let (tx, rx) = mpsc::channel::<LoopMsg>();
@@ -72,7 +105,7 @@ pub fn run_daemon(
 
     // focus adapter (replaceable component, spec §4)
     let adapter: std::sync::Arc<dyn FocusSource> =
-        std::sync::Arc::from(crate::adapters::best_for("auto")?);
+        std::sync::Arc::from(crate::adapters::best_for(&adapter_name)?);
     tracing::info!("focus adapter: {}", adapter.id());
     adapter.install()?;
     {
@@ -99,6 +132,7 @@ pub fn run_daemon(
 
     // spawn readers for managed devices
     let infos = devices::scan(&[])?;
+    let mut device_kbs = std::collections::BTreeMap::<u8, (Kb, bool)>::new();
     let mut tag_next = 0usize;
     for i in &infos {
         if !i.managed {
@@ -108,6 +142,9 @@ pub fn run_daemon(
             Ok(_) => tracing::info!(name = %i.name, path = %i.path.display(), "grabbed"),
             Err(e) => tracing::warn!(name = %i.name, error = %e, "grab failed — device stays native"),
         }
+        let kb_byte = per_device_kb.get(&i.name).copied().unwrap_or_else(|| match default_kb { Kb::Apple => 1, _ => 0 });
+        let dev_kb = match kb_byte { 1 => Kb::Apple, _ => Kb::Windows };
+        device_kbs.insert(tag_next as u8, (dev_kb, default_swap));
         tag_next += 1;
     }
     drop(tx);
@@ -137,8 +174,14 @@ pub fn run_daemon(
                 }
             }
             LoopMsg::Act(tag, act) => {
+                let ctx_now = ctx.get();
+                let rules = match ctx_now {
+                    Ctx::Terminal => &rules_term,
+                    _ => &rules_gui,
+                };
                 let state = states.entry(tag).or_default();
-                let outv = apply(state, act, kb, swap_caps, Ctx::Gui, &rules);
+                let (kb, swap) = device_kbs.get(&(tag as u8)).copied().unwrap_or((default_kb, default_swap));
+                let outv = apply(state, act, kb, swap, ctx_now, rules);
                 emit(&mut sink, outv);
             }
             LoopMsg::Eof(tag) => {
