@@ -101,7 +101,18 @@ pub fn remove_block(content: &str, begin: &str, end: &str) -> String {
             out.push('\n');
         }
     }
-    out
+    // normalize orphan commas + trailing whitespace so the surviving wrapper
+    // stays triviallyvable (JSONC tolerates trailing commas, but strict
+    // parsers like python's json don't — keep both happy)
+    let mut squeezed: Vec<String> = Vec::new();
+    for line in out.lines() {
+        let t = line.trim();
+        if !(t == "," || (t.is_empty() && squeezed.last().map(|l: &String| l.trim().is_empty()).unwrap_or(false))) {
+            squeezed.push(line.to_string());
+        }
+    }
+    let joined = squeezed.join("\n");
+    joined.trim_end().to_string() + "\n"
 }
 
 /// Apply the integration for every detected family under `xdg_config`.

@@ -108,6 +108,18 @@ context = "gui"                    # gui | term | any
 | `mackeys setup` | 幂等重跑（升级 / 改配置后用来重装工件） |
 | `mackeys uninstall` | 反向卸载（顺序：停单元→卸 kwin 脚本→删 unit） |
 
+## VSCode 混合应用（编辑器 + 内嵌终端）
+
+VSCode 这类窗口有两个"焦点层"，键位层面无法感知你人在编辑器还是终端——Toshy 的解法是让 **VSCode 自己**按 `when: terminalFocus` 区分。`mackeys setup` 会自动完成（也可用 `mackeys vscode` 单独重跑）：
+
+- 写入 `~/.config/{Code | Code - OSS | VSCodium}/User/keybindings.json` 的**标记注释块**：
+  - 终端内 **Ctrl+C = 有选区则复制，否则发 SIGINT**（即 macOS 语义）
+  - Ctrl+V 粘贴、Ctrl+R 反查历史、Ctrl+L 清屏、Ctrl+Shift+Backspace 删行、Ctrl+Alt+Backspace 删词
+- 写入 `settings.json` 的 `terminal.integrated.commandsToSkipShell`（保 Cmd+B 的侧栏开关在终端内不被 shell 吃掉）
+- mackeys 端内置 **vsc 规则族**（按窗口类自动生效）：Cmd+`→Ctrl+`（切换内嵌终端）、Cmd+.→Ctrl+.、Cmd+Shift+`→新终端
+
+**撤销**：`mackeys vscode --revert` 一键移除两个 json 里的标记块（仅删标记区，不碰用户自己的条目）；或手动删除 keybindings.json / settings.json 里 `// mackeys: vscode-integration` 包裹的区块。`setup --no-vscode` 可跳过注入。
+
 ## 疑难排查
 
 常见失败场景与对策（都是 doctor 会直接提示的）：
