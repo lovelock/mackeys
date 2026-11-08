@@ -5,6 +5,8 @@ pub mod input;
 mod sink;
 
 use input::LoopMsg;
+use crate::adapters::FocusSource;
+use std::sync::mpsc::{SyncSender, Sender};
 use sink::Sink;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +14,18 @@ use std::sync::{mpsc, Arc};
 
 use crate::engine::{apply, shutdown, DeviceState};
 use crate::types::{Act, Ctx, Kb, Out, RuleSet};
+
+/// Atomic<Ctx> carrier for the event loop.
+#[derive(Default)]
+pub struct AtomicCtx(pub std::sync::atomic::AtomicU8);
+impl AtomicCtx {
+    pub fn get(&self) -> Ctx {
+        match self.0.load(Ordering::Relaxed) { 1 => Ctx::Terminal, _ => Ctx::Gui }
+    }
+    pub fn set(&self, c: Ctx) {
+        self.0.store(match c { Ctx::Terminal => 1, _ => 0 }, Ordering::Relaxed);
+    }
+}
 
 /// Administrative entry for the `run` subcommand.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
@@ -29,7 +43,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         println!("(no grabs performed in dry mode)");
         return Ok(());
     }
-    run_daemon(Kb::Windows, true, RuleSet::default())
+    run_daemon(Kb::Windows, true, RuleSet::default(), vec![])
 }
 
 trait BoolExt {
@@ -41,14 +55,47 @@ impl BoolExt for bool {
     }
 }
 
-pub fn run_daemon(kb: Kb, swap_caps: bool, rules: RuleSet) -> anyhow::Result<()> {
+pub fn run_daemon(
+    kb: Kb,
+    swap_caps: bool,
+    rules: RuleSet,
+    terminal_classes: Vec<String>,
+) -> anyhow::Result<()> {
     tracing::info!("mackeys daemon starting");
     let (tx, rx) = mpsc::channel::<LoopMsg>();
     let stop = Arc::new(AtomicBool::new(false));
+    let ctx = Arc::new(AtomicCtx::default());
 
     // signal handling: SIGINT/SIGTERM set the stop flag; main loop observes it.
     signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone())?;
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone())?;
+
+    // focus adapter (replaceable component, spec §4)
+    let adapter: std::sync::Arc<dyn FocusSource> =
+        std::sync::Arc::from(crate::adapters::best_for("auto")?);
+    tracing::info!("focus adapter: {}", adapter.id());
+    adapter.install()?;
+    {
+        // focus reports bridge into our loop through a relay thread
+        let (sender, recvr) = mpsc::sync_channel::<Option<crate::adapters::WindowReport>>(16);
+        let i_tx = tx.clone();
+        let classes = terminal_classes.clone();
+        std::thread::Builder::new()
+            .name("mackeys-focus-relay".into())
+            .spawn(move || {
+                for report in recvr {
+            let term = report
+                .as_ref()
+                .map(|r| crate::adapters::is_terminal(r, &classes));
+            if i_tx.send(LoopMsg::Focus(term)).is_err() {
+                break;
+            }
+        }
+            })
+            .ok();
+        let adapter_for_watch: std::sync::Arc<dyn FocusSource> = std::sync::Arc::from(adapter);
+        adapter_for_watch.spawn_watch(sender)?;
+    }
 
     // spawn readers for managed devices
     let infos = devices::scan(&[])?;
@@ -76,6 +123,19 @@ pub fn run_daemon(kb: Kb, swap_caps: bool, rules: RuleSet) -> anyhow::Result<()>
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match msg {
+            LoopMsg::Focus(term) => {
+                let newctx = if term.unwrap_or(false) { Ctx::Terminal } else { Ctx::Gui };
+                if ctx.get() != newctx {
+                    // context change: tear down held combos (spec §8 race rule)
+                    for (tag, st) in states.iter_mut() {
+                        let outv = crate::engine::release_held(st);
+                        tracing::debug!(tag, cmds = outv.len(), "context switch teardown");
+                        emit(&mut sink, outv);
+                    }
+                    tracing::info!(kind = if newctx == Ctx::Terminal { "terminal" } else { "gui" }, "context change");
+                    ctx.set(newctx);
+                }
+            }
             LoopMsg::Act(tag, act) => {
                 let state = states.entry(tag).or_default();
                 let outv = apply(state, act, kb, swap_caps, Ctx::Gui, &rules);

@@ -96,6 +96,20 @@ mod tests {
     }
 
     #[test]
+    fn is_terminal_matches_case_insensitively() {
+        use crate::adapters::{is_terminal, WindowReport};
+        let classes = vec!["^konsole".to_string(), "ghostty".to_string()];
+        let konsole = WindowReport { caption: "shell".into(), resource_class: "org.kde.Konsole".into(), resource_name: "zsh".into() };
+        assert!(is_terminal(&konsole, &classes));
+        let konsole2 = WindowReport { caption: "shell".into(), resource_class: "".into(), resource_name: "Konsole".into() };
+        assert!(is_terminal(&konsole2, &classes));
+        let browser = WindowReport { caption: "GitHub".into(), resource_class: "chromium".into(), resource_name: "browser".into() };
+        assert!(!is_terminal(&browser, &classes));
+        let empty = WindowReport { caption: "".into(), resource_class: "".into(), resource_name: "".into() };
+        assert!(!is_terminal(&empty, &classes));
+    }
+
+    #[test]
     fn window_report_is_the_interface_sharing_type() {
         // compile-level pin: adapters::WindowReport exists (FocusSource contract)
         let r = adapters::WindowReport {

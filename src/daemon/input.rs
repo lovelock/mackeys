@@ -12,6 +12,7 @@ pub enum LoopMsg {
     Act(usize, Act),
     /// device disappeared — main loop drops its state
     Eof(usize),
+    Focus(Option<bool>), // Some(is_terminal)
 }
 
 pub struct ReaderHandle {
