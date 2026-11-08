@@ -201,27 +201,19 @@ pub fn run_daemon(
             .unwrap_or(Duration::from_millis(5));
         let msg = match rx.recv_timeout(timeout) {
             Ok(m) => m,
-            Err(mpsc::RecvTimeoutError::Timeout) => LoopMsg::Rescan, // fallback semantics reused
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-
-        match msg {
-            LoopMsg::Rescan => {
-                // periodic fallback: the netlink watcher covers real events;
-                // this branch fires when either deadline was reached
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // wall-clock deadlines: fallback scan + heartbeat. The engine
+                // loop handles no IO itself; scans are always background.
                 if now >= next_scan_fallback {
-                    scan_fallback_count += 1;
-                    tracing::debug!(count = scan_fallback_count, "scan fallback (netlink absent?)");
                     next_scan_fallback = now + Duration::from_secs(SCAN_FALLBACK_SECS);
+                    scan_fallback_count += 1;
+                    tracing::debug!(count = scan_fallback_count, "fallback rescan");
                     let en = enumerator.clone();
                     std::thread::Builder::new()
                         .name("mackeys-enum-fallback".into())
                         .spawn(move || { en.scan_once(); })
                         .ok();
-                    continue;
                 }
-                // heartbeats are wall-clock anchored — a slow loop cannot
-                // postpone them (that is their raison d'être, incident above)
                 if now >= next_heartbeat {
                     next_heartbeat = now + Duration::from_secs(HEARTBEAT_SECS);
                     tracing::info!(
@@ -230,9 +222,25 @@ pub fn run_daemon(
                         "heartbeat (100s wall-clock; keys>0 means events ARE arriving)"
                     );
                     acts_since_tick = 0;
-                    continue;
                 }
-                // unknown/knock request with both deadlines remote: no-op
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        match msg {
+            LoopMsg::Rescan => {
+                // IMMEDIATE background enumeration on device events (the
+                // coalescing latch inside Enumerator absorbs event floods).
+                // This is the path netlink uses — never gate it on deadlines
+                // (bug found 2026-11-08 22:45: replug events fell into the
+                // no-op branch and devices stayed ungrabbed).
+                let en = enumerator.clone();
+                std::thread::Builder::new()
+                    .name("mackeys-enum".into())
+                    .spawn(move || { en.scan_once(); })
+                    .ok();
+                next_scan_fallback = now + Duration::from_secs(SCAN_FALLBACK_SECS);
             }
             LoopMsg::Focus(report) => {
                 if let Some(r) = &report {
