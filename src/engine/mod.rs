@@ -26,7 +26,8 @@ struct SeqState {
 
 #[derive(Debug)]
 struct HeldCombo {
-    key_in: u16,
+    key_in: u16,      // input key (post-modmap) — used to match the release
+    out_key: u16,     // output key actually pressed (rule's c.key)
     #[allow(dead_code)]
     out: Combo,
     out_pressed: Vec<u16>,
@@ -96,7 +97,7 @@ impl DeviceState {
         let Some(h) = self.held_combo.take() else {
             return vec![];
         };
-        let mut outv = vec![Out::Key(h.key_in, 0)];
+        let mut outv = vec![Out::Key(h.out_key, 0)];
         for m in &h.out_pressed {
             outv.push(Out::Key(*m, 0));
             if let Some(ks) = self
@@ -289,7 +290,11 @@ fn process_inner(
                             }
                         }
                     }
-                    outv.push(Out::Key(out_code, 1));
+                    // press the RULE's output key (may differ from the input key,
+                    // e.g. Cmd+Q -> Alt+F4). The release matches on key_in and
+                    // tears down out_key.
+                    let out_key = c.key.unwrap_or(out_code);
+                    outv.push(Out::Key(out_key, 1));
                     outv.push(Out::Sync);
                     let filtered_pressed: Vec<u16> = pressed
                         .into_iter()
@@ -297,6 +302,7 @@ fn process_inner(
                         .collect();
                     state.held_combo = Some(HeldCombo {
                         key_in: out_code,
+                        out_key,
                         out: c.clone(),
                         out_pressed: filtered_pressed,
                     });

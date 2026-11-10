@@ -540,3 +540,38 @@ fn seq_output_emits_and_replays() {
     let got4: Vec<Out> = super::apply(&mut st, act(30, 2), Kb::Windows, true, Ctx::Gui, &rules, Some("code"));
     assert!(got4.is_empty(), "plain repeats dropped");
 }
+
+// ---- regression: combo output must press the RULE's key, not the input key ----
+#[test]
+fn combo_output_key_differs_from_input() {
+    // cmd+Q style: input R_CTRL(97)+Q(16) -> output L_ALT(56)+F4(62)
+    let rules = RuleSet {
+        rules: vec![Rule {
+            id: "cmd_q".into(),
+            builtin: true,
+            sticky: false,
+            context: Ctx::Gui,
+            input: combo(&[97], Some(16)),
+            apps: None,
+            output: OutputSel::Combo(combo(&[56], Some(62))),
+        }],
+    };
+    let acts = [act(56, 1), act(16, 1), act(16, 0), act(56, 0)];
+    let got = drive(Kb::Windows, true, Ctx::Gui, &rules, &acts);
+    assert!(
+        got.contains(&Out::Key(62, 1)),
+        "output must press F4 (rule key), got {got:?}"
+    );
+    assert!(
+        got.contains(&Out::Key(62, 0)),
+        "output must release F4 on input release, got {got:?}"
+    );
+    assert!(
+        !got.iter().any(|e| matches!(e, Out::Key(16, 1))),
+        "input key Q must NOT be forwarded when rule rewrites it, got {got:?}"
+    );
+    // release order: F4 up before ALT up
+    let f4up = got.iter().position(|e| matches!(e, Out::Key(62, 0))).unwrap();
+    let altup = got.iter().position(|e| matches!(e, Out::Key(56, 0))).unwrap();
+    assert!(f4up < altup);
+}
