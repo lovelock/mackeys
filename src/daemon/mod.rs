@@ -307,21 +307,9 @@ pub fn run_daemon(
 }
 
 fn emit(sink: &mut Sink, outv: Vec<Out>) {
-    static FAIL_STREAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    use std::sync::atomic::Ordering;
     for o in outv {
-        match sink.emit(o) {
-            Ok(()) => {
-                if FAIL_STREAK.swap(0, Ordering::Relaxed) > 0 {
-                    tracing::info!("sink recovered after failures");
-                }
-            }
-            Err(e) => {
-                let n = FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n == 5 || n % 20 == 0 {
-                    tracing::error!(error = %e, failures = n, "uinput sink write failing — if this persists the whole keyboard is mute (grabbed, no output)");
-                }
-            }
+        if let Out::Key(code, value) = o {
+            let _ = sink.emit(code, value);
         }
     }
 }

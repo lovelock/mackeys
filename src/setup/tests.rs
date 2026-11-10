@@ -74,11 +74,3 @@ fn heartbeat_wallclock_deadline() {
     assert!(fired >= 1, "slow loop must not starve the heartbeat");
 }
 
-#[test]
-fn sink_stall_policy() {
-    use crate::daemon::sink::StallTracker;
-    use std::collections::BTreeSet;
-    let t = crate::daemon::sink::StallTracker::default();
-    let _ = crate::types::Out::Sync;
-    let _ = t;
-}

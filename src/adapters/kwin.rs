@@ -17,6 +17,21 @@ pub struct KwinAdapter {
     current: Arc<Mutex<Option<WindowReport>>>,
 }
 
+fn kpackagetool_cmd() -> Option<&'static str> {
+    ["kpackagetool6", "kpackagetool5"]
+        .iter()
+        .find(|c| std::process::Command::new(c).arg("--help").output().map(|o| o.status.success() || true).unwrap_or(false))
+        .copied()
+}
+
+fn kwriteconfig_cmd() -> &'static str {
+    if std::process::Command::new("kwriteconfig6").arg("--help").output().is_ok() {
+        "kwriteconfig6"
+    } else {
+        "kwriteconfig5"
+    }
+}
+
 impl KwinAdapter {
     pub fn new() -> Self {
         KwinAdapter {
@@ -110,58 +125,97 @@ impl super::FocusSource for KwinAdapter {
         "kwin"
     }
     fn install(&self) -> Result<()> {
-        let dir = self.script_dir()?;
-        let code_dir = dir.join("contents/code");
-        std::fs::create_dir_all(&code_dir)?;
-        std::fs::write(dir.join("metadata.json"), SCRIPT_NAME_META)?;
-        std::fs::write(code_dir.join("main.js"), SCRIPT_MAIN)?;
+        // Faithful port of toshy_kwin_script_setup.py:
+        //   1. zip contents/code/main.js + metadata.json into <name>.kwinscript
+        //   2. kpackagetool6 -t KWin/Script -r <name>   (remove, errors ignored)
+        //   3. kpackagetool6 -t KWin/Script -i <zip>    (install via KPackage!)
+        //   4. kwriteconfig6 kwinrc Plugins <name>Enabled true
+        //   5. reconfigure + up to 6 polling rounds of (reconfigure + 5 s)
+        // Direct fs writes alone do NOT register the package (this was the
+        // original boot flakiness — kpackagetool is what Toshy relies on).
+        let kp = kpackagetool_cmd();
+        if kp.is_none() {
+            anyhow::bail!("kpackagetool6/5 not found — cannot install KWin script");
+        }
+        let kp = kp.unwrap();
+        let kw = kwriteconfig_cmd();
 
-        // Enable persistently (Toshy knowledge: dbus loadScript alone doesn't
-        // START the script; kwinrc Plugins.<Id>Enabled=true + reconfigure does)
-        let enabled_key = super::kwinrc_enabled_key(SCRIPT_ID); // "mackeys-focusEnabled"
-        for kw in ["kwriteconfig6", "kwriteconfig5"] {
-            let _ = std::process::Command::new(kw)
-                .args(["--file", "kwinrc", "--group", "Plugins", "--key", &enabled_key, "true"])
-                .output();
-            // retire the legacy camelCase stray key from earlier releases (C3)
-            let _ = std::process::Command::new(kw)
-                .args(["--file", "kwinrc", "--group", "Plugins", "--key", "mackeysFocusEnabled", "--delete"])
-                .output();
+        let zip_path = std::env::temp_dir().join(format!("{SCRIPT_ID}.kwinscript"));
+        {
+            use std::io::Write as _;
+            let file = std::fs::File::create(&zip_path)
+                .with_context(|| format!("create {}", zip_path.display()))?;
+            let mut zf = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zf.start_file("contents/code/main.js", opts)?;
+            zf.write_all(SCRIPT_MAIN.as_bytes())?;
+            zf.start_file("metadata.json", opts)?;
+            zf.write_all(SCRIPT_NAME_META.as_bytes())?;
+            zf.finish()?;
         }
 
-        // dbus loadScript(s) is a path-based no-op (review C3): kwinrc
-        // Enabled=true + reconfigure is the load path that actually works
-        let _ = self.kwin_dbus_call("reconfigure", None);
+        // remove old (ignore failure), then install
+        let _ = std::process::Command::new(&kp)
+            .args(["-t", "KWin/Script", "-r", SCRIPT_ID])
+            .output();
+        let out = std::process::Command::new(&kp)
+            .args(["-t", "KWin/Script", "-i"])
+            .arg(&zip_path)
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "kpackagetool install failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let _ = std::fs::remove_file(&zip_path);
+        tracing::info!("kwin adapter: script installed via {kp}.");
 
-        // At boot KWin itself may still be initializing long after
-        // graphical-session.target — poll generously, never bail the daemon
-        // early (incident 2026-11-08: 5×700ms crash-looped the unit 19×).
-        let loaded_ok = super::poll_until(
-            12,
-            std::time::Duration::from_millis(1500),
-            || self.script_loaded(),
-        );
-        if loaded_ok {
+        // enable persistently
+        let _ = std::process::Command::new(&kw)
+            .args([
+                "--file", "kwinrc", "--group", "Plugins", "--key",
+                &format!("{SCRIPT_ID}Enabled"), "true",
+            ])
+            .output();
+
+        // reconfigure + polling loop (6 rounds × 5 s, Toshy numbers)
+        let _ = self.kwin_dbus_call("reconfigure", None);
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        for _ in 0..6 {
+            if self.script_loaded() {
+                tracing::info!("kwin adapter: script installed & loaded ({}).", SCRIPT_ID);
+                return Ok(());
+            }
+            let _ = self.kwin_dbus_call("reconfigure", None);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+        if self.script_loaded() {
             tracing::info!("kwin adapter: script installed & loaded ({}).", SCRIPT_ID);
             return Ok(());
         }
         Err(anyhow::anyhow!(
-            "kwin script did not report loaded within poll window — daemon keeps retrying in background"
+            "kwin script did not report loaded after 6 reconfigure rounds — background retry continues"
         ))
     }
     fn uninstall(&self) -> Result<()> {
-        let _ = self.kwin_dbus_call("unloadScript", Some(SCRIPT_ID));
-        let enabled_key = super::kwinrc_enabled_key(SCRIPT_ID);
-        for kw in ["kwriteconfig6", "kwriteconfig5"] {
-            let _ = std::process::Command::new(kw)
-                .args(["--file", "kwinrc", "--group", "Plugins", "--key", &enabled_key, "false"])
+        if let Some(kp) = kpackagetool_cmd() {
+            let _ = std::process::Command::new(kp)
+                .args(["-t", "KWin/Script", "-r", SCRIPT_ID])
                 .output();
         }
-        let dir = self.script_dir()?;
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
+        let _ = self.kwin_dbus_call("unloadScript", Some(SCRIPT_ID));
+        let kw = kwriteconfig_cmd();
+        {
+            let _ = std::process::Command::new(kw)
+                .args([
+                    "--file", "kwinrc", "--group", "Plugins", "--key",
+                    &format!("{SCRIPT_ID}Enabled"), "false",
+                ])
+                .output();
         }
-        tracing::info!("kwin adapter: script unloaded & removed");
+        tracing::info!("kwin adapter: script removed");
         Ok(())
     }
     fn current(&self) -> Option<WindowReport> {
