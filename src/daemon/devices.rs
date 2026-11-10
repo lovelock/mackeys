@@ -28,6 +28,14 @@ pub fn classify(
         return false; // never grab our own output
     }
     if n.to_lowercase().contains("virtual") {
+        // lab isolation hook: MACKEYS_TEST_GRAB lets a test rig grab its own
+        // synthetic keyboard (name match) so the pipeline can be exercised
+        // without touching the physical devices
+        if let Ok(pat) = std::env::var("MACKEYS_TEST_GRAB") {
+            if !pat.is_empty() && n.contains(&pat) {
+                return true;
+            }
+        }
         return false; // other remappers' virtual devices (XWayKeyz etc.) — no recursion
     }
     if excludes.iter().any(|x| n.contains(x.as_str())) {
@@ -37,7 +45,15 @@ pub fn classify(
 }
 
 /// Enumerate /dev/input/event* and classify.
+/// (devices, saw_permission_race) — true when some node was not yet
+/// accessible, which happens for a few ms after udev creates it.
 pub fn scan(excludes: &[String]) -> anyhow::Result<Vec<DeviceInfo>> {
+    let (devs, _race) = scan_with_race(excludes)?;
+    Ok(devs)
+}
+
+pub fn scan_with_race(excludes: &[String]) -> anyhow::Result<(Vec<DeviceInfo>, bool)> {
+    let mut saw_race = false;
     let mut infos = Vec::new();
     for entry in std::fs::read_dir("/dev/input")? {
         let entry = entry?;
@@ -49,6 +65,9 @@ pub fn scan(excludes: &[String]) -> anyhow::Result<Vec<DeviceInfo>> {
         let dev = match Device::open(&path) {
             Ok(d) => d,
             Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    saw_race = true; // udev still applying group/uaccess
+                }
                 tracing::debug!(path = %fname, error = %e, "cannot open device");
                 continue;
             }
@@ -63,7 +82,7 @@ pub fn scan(excludes: &[String]) -> anyhow::Result<Vec<DeviceInfo>> {
         });
     }
     infos.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(infos)
+    Ok((infos, saw_race))
 }
 
 fn has_letter_keys(dev: &Device) -> bool {

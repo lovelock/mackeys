@@ -86,6 +86,10 @@ impl Sink {
         std::thread::sleep(Self::MIN_PRE);
         let ev = InputEvent::new(EventType::KEY.0, code, value);
         let res = self.virt.emit(&[ev]);
+        match &res {
+            Ok(()) => tracing::trace!(code, value, "uinput write ok"),
+            Err(e) => tracing::debug!(code, value, error = %e, "uinput write result"),
+        }
         std::thread::sleep(Self::MIN_POST);
         match res {
             Ok(()) => Ok(()),

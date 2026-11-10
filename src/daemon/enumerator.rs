@@ -53,8 +53,10 @@ impl Enumerator {
             return 0;
         }
         let mut grabbed = 0usize;
-        match devices::scan(&self.excludes) {
-            Ok(infos) => {
+        let mut permission_race = false;
+        match devices::scan_with_race(&self.excludes) {
+            Ok((infos, race)) => {
+                permission_race = race;
                 for i in infos.iter().filter(|i| i.managed) {
                     let fresh = {
                         let mut sp = self.spawned.lock().unwrap();
@@ -104,6 +106,26 @@ impl Enumerator {
             Err(e) => tracing::warn!(error = %e, "device scan failed — will retry on next trigger"),
         }
         self.busy.store(false, Ordering::Relaxed);
+        if permission_race {
+            // udev hasn't applied device permissions yet (sub-second window).
+            // Toshy uses an inotify ATTRIB watcher for this; we mirror with a
+            // quick self-scheduled retry instead of waiting for the 60 s fallback.
+            let me = self.clone();
+            std::thread::Builder::new()
+                .name("mackeys-enum-perm-retry".into())
+                .spawn(move || {
+                    for _ in 0..20 {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let Ok((_, still_race)) = devices::scan_with_race(&me.excludes) else { return };
+                        if !still_race {
+                            let _ = me.scan_once();
+                            return;
+                        }
+                    }
+                    tracing::debug!("perm race retries exhausted");
+                })
+                .ok();
+        }
         grabbed
     }
 

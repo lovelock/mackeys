@@ -281,12 +281,18 @@ pub fn run_daemon(
                     .get(&(tag as u8))
                     .copied()
                     .unwrap_or((default_kb, default_swap));
-                let cur_app = cur_report
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|r| r.resource_class.clone())
-                    .or_else(|| cur_report.lock().unwrap().as_ref().map(|r| r.resource_name.clone()));
+                // NOTE: single guard — never lock the same mutex twice in one
+                // expression (temporary guards live to end-of-statement; the
+                // double-lock here was a self-deadlock, root cause of every
+                // "keyboard mute" incident: first keypress while no focus
+                // report had arrived yet).
+                let cur_app = {
+                    let guard = cur_report.lock().unwrap();
+                    match guard.as_ref() {
+                        Some(r) => Some(r.resource_class.clone()),
+                        None => None,
+                    }
+                };
                 let outv = apply(state, act, kb, swap, ctx_now, rules, cur_app.as_deref());
                 emit(&mut sink, outv);
             }
