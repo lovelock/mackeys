@@ -36,7 +36,7 @@ impl AtomicCtx {
 }
 
 const SCAN_FALLBACK_SECS: u64 = 60; // belt & suspenders when netlink is deaf
-const HEARTBEAT_SECS: u64 = 100; // wall-clock based on purpose
+const HEARTBEAT_SECS: u64 = 30; // wall-clock based on purpose (diagnostic window)
 
 /// Administrative entry for the `run` subcommand.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
@@ -196,9 +196,12 @@ pub fn run_daemon(
 
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
+        // cap at 200 ms: SIGTERM must be honored long before systemd's 10 s
+        // stop timeout (bug: a 60 s recv window made `systemctl stop` SIGKILL)
         let timeout = std::cmp::min(next_heartbeat, next_scan_fallback)
             .checked_duration_since(now)
-            .unwrap_or(Duration::from_millis(5));
+            .unwrap_or(Duration::from_millis(5))
+            .min(Duration::from_millis(200));
         let msg = match rx.recv_timeout(timeout) {
             Ok(m) => m,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -230,6 +233,7 @@ pub fn run_daemon(
 
         match msg {
             LoopMsg::Rescan => {
+                tracing::info!("device event → enumeration");
                 // IMMEDIATE background enumeration on device events (the
                 // coalescing latch inside Enumerator absorbs event floods).
                 // This is the path netlink uses — never gate it on deadlines
